@@ -18,651 +18,113 @@ package evictions
 
 import (
 	"context"
+	"fmt"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
+	policy "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
-	"k8s.io/client-go/kubernetes/fake"
+	fakeclientset "k8s.io/client-go/kubernetes/fake"
 	core "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/events"
+	"k8s.io/component-base/featuregate"
+	"k8s.io/klog/v2"
+	utilptr "k8s.io/utils/ptr"
+
+	metricstest "k8s.io/component-base/metrics/testutil"
+
+	deschedulermetrics "sigs.k8s.io/descheduler/metrics"
 	podutil "sigs.k8s.io/descheduler/pkg/descheduler/pod"
+	"sigs.k8s.io/descheduler/pkg/features"
 	"sigs.k8s.io/descheduler/pkg/utils"
 	"sigs.k8s.io/descheduler/test"
 )
 
+const (
+	notFoundText    = "pod not found when evicting \"%s\": pods \"%s\" not found"
+	tooManyRequests = "error when evicting pod (ignoring) \"%s\": Too many requests: too many requests"
+)
+
+func initFeatureGates() featuregate.FeatureGate {
+	featureGates := featuregate.NewFeatureGate()
+	featureGates.Add(map[featuregate.Feature]featuregate.FeatureSpec{
+		features.EvictionsInBackground: {Default: true, PreRelease: featuregate.Alpha},
+	})
+	return featureGates
+}
+
 func TestEvictPod(t *testing.T) {
-	ctx := context.Background()
 	node1 := test.BuildTestNode("node1", 1000, 2000, 9, nil)
 	pod1 := test.BuildTestPod("p1", 400, 0, "node1", nil)
 	tests := []struct {
 		description string
 		node        *v1.Node
-		pod         *v1.Pod
-		pods        []v1.Pod
-		want        error
+		evictedPod  *v1.Pod
+		pods        []runtime.Object
+		wantErr     error
 	}{
 		{
 			description: "test pod eviction - pod present",
 			node:        node1,
-			pod:         pod1,
-			pods:        []v1.Pod{*pod1},
-			want:        nil,
+			evictedPod:  pod1,
+			pods:        []runtime.Object{pod1},
 		},
 		{
-			description: "test pod eviction - pod absent",
+			description: "test pod eviction - pod absent (not found error)",
 			node:        node1,
-			pod:         pod1,
-			pods:        []v1.Pod{*test.BuildTestPod("p2", 400, 0, "node1", nil), *test.BuildTestPod("p3", 450, 0, "node1", nil)},
-			want:        nil,
+			evictedPod:  pod1,
+			pods:        []runtime.Object{test.BuildTestPod("p2", 400, 0, "node1", nil), test.BuildTestPod("p3", 450, 0, "node1", nil)},
+			wantErr:     fmt.Errorf(notFoundText, pod1.Name, pod1.Name),
+		},
+		{
+			description: "test pod eviction - pod absent (too many requests error)",
+			node:        node1,
+			evictedPod:  pod1,
+			pods:        []runtime.Object{test.BuildTestPod("p2", 400, 0, "node1", nil), test.BuildTestPod("p3", 450, 0, "node1", nil)},
+			wantErr:     fmt.Errorf(tooManyRequests, pod1.Name),
 		},
 	}
 
 	for _, test := range tests {
-		fakeClient := &fake.Clientset{}
-		fakeClient.Fake.AddReactor("list", "pods", func(action core.Action) (bool, runtime.Object, error) {
-			return true, &v1.PodList{Items: test.pods}, nil
-		})
-		got := evictPod(ctx, fakeClient, test.pod, "v1")
-		if got != test.want {
-			t.Errorf("Test error for Desc: %s. Expected %v pod eviction to be %v, got %v", test.description, test.pod.Name, test.want, got)
-		}
-	}
-}
-
-func TestIsEvictable(t *testing.T) {
-	n1 := test.BuildTestNode("node1", 1000, 2000, 13, nil)
-	lowPriority := int32(800)
-	highPriority := int32(900)
-
-	nodeTaintKey := "hardware"
-	nodeTaintValue := "gpu"
-
-	nodeLabelKey := "datacenter"
-	nodeLabelValue := "east"
-	type testCase struct {
-		description             string
-		pods                    []*v1.Pod
-		nodes                   []*v1.Node
-		evictFailedBarePods     bool
-		evictLocalStoragePods   bool
-		evictSystemCriticalPods bool
-		priorityThreshold       *int32
-		nodeFit                 bool
-		result                  bool
-	}
-
-	testCases := []testCase{
-		{
-			description: "Failed pod eviction with no ownerRefs",
-			pods: []*v1.Pod{
-				test.BuildTestPod("bare_pod_failed", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.Status.Phase = v1.PodFailed
-				}),
-			},
-			evictFailedBarePods: false,
-			result:              false,
-		}, {
-			description:         "Normal pod eviction with no ownerRefs and evictFailedBarePods enabled",
-			pods:                []*v1.Pod{test.BuildTestPod("bare_pod", 400, 0, n1.Name, nil)},
-			evictFailedBarePods: true,
-			result:              false,
-		}, {
-			description: "Failed pod eviction with no ownerRefs",
-			pods: []*v1.Pod{
-				test.BuildTestPod("bare_pod_failed_but_can_be_evicted", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.Status.Phase = v1.PodFailed
-				}),
-			},
-			evictFailedBarePods: true,
-			result:              true,
-		}, {
-			description: "Normal pod eviction with normal ownerRefs",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p1", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			result:                  true,
-		}, {
-			description: "Normal pod eviction with normal ownerRefs and descheduler.alpha.kubernetes.io/evict annotation",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p2", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.Annotations = map[string]string{"descheduler.alpha.kubernetes.io/evict": "true"}
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			result:                  true,
-		}, {
-			description: "Normal pod eviction with replicaSet ownerRefs",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p3", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			result:                  true,
-		}, {
-			description: "Normal pod eviction with replicaSet ownerRefs and descheduler.alpha.kubernetes.io/evict annotation",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p4", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.Annotations = map[string]string{"descheduler.alpha.kubernetes.io/evict": "true"}
-					pod.ObjectMeta.OwnerReferences = test.GetReplicaSetOwnerRefList()
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			result:                  true,
-		}, {
-			description: "Normal pod eviction with statefulSet ownerRefs",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p18", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			result:                  true,
-		}, {
-			description: "Normal pod eviction with statefulSet ownerRefs and descheduler.alpha.kubernetes.io/evict annotation",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p19", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.Annotations = map[string]string{"descheduler.alpha.kubernetes.io/evict": "true"}
-					pod.ObjectMeta.OwnerReferences = test.GetStatefulSetOwnerRefList()
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			result:                  true,
-		}, {
-			description: "Pod not evicted because it is bound to a PV and evictLocalStoragePods = false",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p5", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-					pod.Spec.Volumes = []v1.Volume{
-						{
-							Name: "sample",
-							VolumeSource: v1.VolumeSource{
-								HostPath: &v1.HostPathVolumeSource{Path: "somePath"},
-								EmptyDir: &v1.EmptyDirVolumeSource{
-									SizeLimit: resource.NewQuantity(int64(10), resource.BinarySI)},
-							},
-						},
-					}
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			result:                  false,
-		}, {
-			description: "Pod is evicted because it is bound to a PV and evictLocalStoragePods = true",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p6", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-					pod.Spec.Volumes = []v1.Volume{
-						{
-							Name: "sample",
-							VolumeSource: v1.VolumeSource{
-								HostPath: &v1.HostPathVolumeSource{Path: "somePath"},
-								EmptyDir: &v1.EmptyDirVolumeSource{
-									SizeLimit: resource.NewQuantity(int64(10), resource.BinarySI)},
-							},
-						},
-					}
-				}),
-			},
-			evictLocalStoragePods:   true,
-			evictSystemCriticalPods: false,
-			result:                  true,
-		}, {
-			description: "Pod is evicted because it is bound to a PV and evictLocalStoragePods = false, but it has scheduler.alpha.kubernetes.io/evict annotation",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p7", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.Annotations = map[string]string{"descheduler.alpha.kubernetes.io/evict": "true"}
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-					pod.Spec.Volumes = []v1.Volume{
-						{
-							Name: "sample",
-							VolumeSource: v1.VolumeSource{
-								HostPath: &v1.HostPathVolumeSource{Path: "somePath"},
-								EmptyDir: &v1.EmptyDirVolumeSource{
-									SizeLimit: resource.NewQuantity(int64(10), resource.BinarySI)},
-							},
-						},
-					}
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			result:                  true,
-		}, {
-			description: "Pod not evicted becasuse it is part of a daemonSet",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p8", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-					pod.ObjectMeta.OwnerReferences = test.GetDaemonSetOwnerRefList()
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			result:                  false,
-		}, {
-			description: "Pod is evicted becasuse it is part of a daemonSet, but it has scheduler.alpha.kubernetes.io/evict annotation",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p9", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.Annotations = map[string]string{"descheduler.alpha.kubernetes.io/evict": "true"}
-					pod.ObjectMeta.OwnerReferences = test.GetDaemonSetOwnerRefList()
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			result:                  true,
-		}, {
-			description: "Pod not evicted becasuse it is a mirror poddsa",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p10", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-					pod.Annotations = test.GetMirrorPodAnnotation()
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			result:                  false,
-		}, {
-			description: "Pod is evicted becasuse it is a mirror pod, but it has scheduler.alpha.kubernetes.io/evict annotation",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p11", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-					pod.Annotations = test.GetMirrorPodAnnotation()
-					pod.Annotations["descheduler.alpha.kubernetes.io/evict"] = "true"
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			result:                  true,
-		}, {
-			description: "Pod not evicted becasuse it has system critical priority",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p12", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-					priority := utils.SystemCriticalPriority
-					pod.Spec.Priority = &priority
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			result:                  false,
-		}, {
-			description: "Pod is evicted becasuse it has system critical priority, but it has scheduler.alpha.kubernetes.io/evict annotation",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p13", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-					priority := utils.SystemCriticalPriority
-					pod.Spec.Priority = &priority
-					pod.Annotations = map[string]string{
-						"descheduler.alpha.kubernetes.io/evict": "true",
-					}
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			result:                  true,
-		}, {
-			description: "Pod not evicted becasuse it has a priority higher than the configured priority threshold",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p14", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-					pod.Spec.Priority = &highPriority
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			priorityThreshold:       &lowPriority,
-			result:                  false,
-		}, {
-			description: "Pod is evicted becasuse it has a priority higher than the configured priority threshold, but it has scheduler.alpha.kubernetes.io/evict annotation",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p15", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-					pod.Annotations = map[string]string{"descheduler.alpha.kubernetes.io/evict": "true"}
-					pod.Spec.Priority = &highPriority
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			priorityThreshold:       &lowPriority,
-			result:                  true,
-		}, {
-			description: "Pod is evicted becasuse it has system critical priority, but evictSystemCriticalPods = true",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p16", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-					priority := utils.SystemCriticalPriority
-					pod.Spec.Priority = &priority
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: true,
-			result:                  true,
-		}, {
-			description: "Pod is evicted becasuse it has system critical priority, but evictSystemCriticalPods = true and it has scheduler.alpha.kubernetes.io/evict annotation",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p16", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-					pod.Annotations = map[string]string{"descheduler.alpha.kubernetes.io/evict": "true"}
-					priority := utils.SystemCriticalPriority
-					pod.Spec.Priority = &priority
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: true,
-			result:                  true,
-		}, {
-			description: "Pod is evicted becasuse it has a priority higher than the configured priority threshold, but evictSystemCriticalPods = true",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p17", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-					pod.Spec.Priority = &highPriority
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: true,
-			priorityThreshold:       &lowPriority,
-			result:                  true,
-		}, {
-			description: "Pod is evicted becasuse it has a priority higher than the configured priority threshold, but evictSystemCriticalPods = true and it has scheduler.alpha.kubernetes.io/evict annotation",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p17", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-					pod.Annotations = map[string]string{"descheduler.alpha.kubernetes.io/evict": "true"}
-					pod.Spec.Priority = &highPriority
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: true,
-			priorityThreshold:       &lowPriority,
-			result:                  true,
-		}, {
-			description: "Pod with no tolerations running on normal node, all other nodes tainted",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p1", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-				}),
-			},
-			nodes: []*v1.Node{
-				test.BuildTestNode("node2", 1000, 2000, 13, func(node *v1.Node) {
-					node.Spec.Taints = []v1.Taint{
-						{
-							Key:    nodeTaintKey,
-							Value:  nodeTaintValue,
-							Effect: v1.TaintEffectNoSchedule,
-						},
-					}
-				}),
-				test.BuildTestNode("node3", 1000, 2000, 13, func(node *v1.Node) {
-					node.Spec.Taints = []v1.Taint{
-						{
-							Key:    nodeTaintKey,
-							Value:  nodeTaintValue,
-							Effect: v1.TaintEffectNoSchedule,
-						},
-					}
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			nodeFit:                 true,
-			result:                  false,
-		}, {
-			description: "Pod with correct tolerations running on normal node, all other nodes tainted",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p1", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-					pod.Spec.Tolerations = []v1.Toleration{
-						{
-							Key:    nodeTaintKey,
-							Value:  nodeTaintValue,
-							Effect: v1.TaintEffectNoSchedule,
-						},
-					}
-				}),
-			},
-			nodes: []*v1.Node{
-				test.BuildTestNode("node2", 1000, 2000, 13, func(node *v1.Node) {
-					node.Spec.Taints = []v1.Taint{
-						{
-							Key:    nodeTaintKey,
-							Value:  nodeTaintValue,
-							Effect: v1.TaintEffectNoSchedule,
-						},
-					}
-				}),
-				test.BuildTestNode("node3", 1000, 2000, 13, func(node *v1.Node) {
-					node.Spec.Taints = []v1.Taint{
-						{
-							Key:    nodeTaintKey,
-							Value:  nodeTaintValue,
-							Effect: v1.TaintEffectNoSchedule,
-						},
-					}
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			nodeFit:                 true,
-			result:                  true,
-		}, {
-			description: "Pod with incorrect node selector",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p1", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-					pod.Spec.NodeSelector = map[string]string{
-						nodeLabelKey: "fail",
-					}
-				}),
-			},
-			nodes: []*v1.Node{
-				test.BuildTestNode("node2", 1000, 2000, 13, func(node *v1.Node) {
-					node.ObjectMeta.Labels = map[string]string{
-						nodeLabelKey: nodeLabelValue,
-					}
-				}),
-				test.BuildTestNode("node3", 1000, 2000, 13, func(node *v1.Node) {
-					node.ObjectMeta.Labels = map[string]string{
-						nodeLabelKey: nodeLabelValue,
-					}
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			nodeFit:                 true,
-			result:                  false,
-		}, {
-			description: "Pod with correct node selector",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p1", 400, 0, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-					pod.Spec.NodeSelector = map[string]string{
-						nodeLabelKey: nodeLabelValue,
-					}
-				}),
-			},
-			nodes: []*v1.Node{
-				test.BuildTestNode("node2", 1000, 2000, 13, func(node *v1.Node) {
-					node.ObjectMeta.Labels = map[string]string{
-						nodeLabelKey: nodeLabelValue,
-					}
-				}),
-				test.BuildTestNode("node3", 1000, 2000, 13, func(node *v1.Node) {
-					node.ObjectMeta.Labels = map[string]string{
-						nodeLabelKey: nodeLabelValue,
-					}
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			nodeFit:                 true,
-			result:                  true,
-		}, {
-			description: "Pod with correct node selector, but only available node doesn't have enough CPU",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p1", 12, 8, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-					pod.Spec.NodeSelector = map[string]string{
-						nodeLabelKey: nodeLabelValue,
-					}
-				}),
-			},
-			nodes: []*v1.Node{
-				test.BuildTestNode("node2-TEST", 10, 16, 10, func(node *v1.Node) {
-					node.ObjectMeta.Labels = map[string]string{
-						nodeLabelKey: nodeLabelValue,
-					}
-				}),
-				test.BuildTestNode("node3-TEST", 10, 16, 10, func(node *v1.Node) {
-					node.ObjectMeta.Labels = map[string]string{
-						nodeLabelKey: nodeLabelValue,
-					}
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			nodeFit:                 true,
-			result:                  false,
-		}, {
-			description: "Pod with correct node selector, and one node has enough memory",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p1", 12, 8, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-					pod.Spec.NodeSelector = map[string]string{
-						nodeLabelKey: nodeLabelValue,
-					}
-				}),
-				test.BuildTestPod("node2-pod-10GB-mem", 20, 10, "node2", func(pod *v1.Pod) {
-					pod.ObjectMeta.Labels = map[string]string{
-						"test": "true",
-					}
-				}),
-				test.BuildTestPod("node3-pod-10GB-mem", 20, 10, "node3", func(pod *v1.Pod) {
-					pod.ObjectMeta.Labels = map[string]string{
-						"test": "true",
-					}
-				}),
-			},
-			nodes: []*v1.Node{
-				test.BuildTestNode("node2", 100, 16, 10, func(node *v1.Node) {
-					node.ObjectMeta.Labels = map[string]string{
-						nodeLabelKey: nodeLabelValue,
-					}
-				}),
-				test.BuildTestNode("node3", 100, 20, 10, func(node *v1.Node) {
-					node.ObjectMeta.Labels = map[string]string{
-						nodeLabelKey: nodeLabelValue,
-					}
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			nodeFit:                 true,
-			result:                  true,
-		}, {
-			description: "Pod with correct node selector, but both nodes don't have enough memory",
-			pods: []*v1.Pod{
-				test.BuildTestPod("p1", 12, 8, n1.Name, func(pod *v1.Pod) {
-					pod.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
-					pod.Spec.NodeSelector = map[string]string{
-						nodeLabelKey: nodeLabelValue,
-					}
-				}),
-				test.BuildTestPod("node2-pod-10GB-mem", 10, 10, "node2", func(pod *v1.Pod) {
-					pod.ObjectMeta.Labels = map[string]string{
-						"test": "true",
-					}
-				}),
-				test.BuildTestPod("node3-pod-10GB-mem", 10, 10, "node3", func(pod *v1.Pod) {
-					pod.ObjectMeta.Labels = map[string]string{
-						"test": "true",
-					}
-				}),
-			},
-			nodes: []*v1.Node{
-				test.BuildTestNode("node2", 100, 16, 10, func(node *v1.Node) {
-					node.ObjectMeta.Labels = map[string]string{
-						nodeLabelKey: nodeLabelValue,
-					}
-				}),
-				test.BuildTestNode("node3", 100, 16, 10, func(node *v1.Node) {
-					node.ObjectMeta.Labels = map[string]string{
-						nodeLabelKey: nodeLabelValue,
-					}
-				}),
-			},
-			evictLocalStoragePods:   false,
-			evictSystemCriticalPods: false,
-			nodeFit:                 true,
-			result:                  false,
-		},
-	}
-
-	for _, test := range testCases {
-
 		t.Run(test.description, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-
-			nodes := append(test.nodes, n1)
-
-			var objs []runtime.Object
-			for _, node := range test.nodes {
-				objs = append(objs, node)
-			}
-			for _, pod := range test.pods {
-				objs = append(objs, pod)
-			}
-
-			fakeClient := fake.NewSimpleClientset(objs...)
-
+			ctx := context.Background()
+			fakeClient := fakeclientset.NewClientset(test.pods...)
+			fakeClient.PrependReactor("create", "pods/eviction", func(action core.Action) (handled bool, ret runtime.Object, err error) {
+				return true, nil, test.wantErr
+			})
 			sharedInformerFactory := informers.NewSharedInformerFactory(fakeClient, 0)
-			podInformer := sharedInformerFactory.Core().V1().Pods()
-
-			getPodsAssignedToNode, err := podutil.BuildGetPodsAssignedToNodeFunc(podInformer)
-			if err != nil {
-				t.Errorf("Build get pods assigned to node function error: %v", err)
-			}
-
 			sharedInformerFactory.Start(ctx.Done())
 			sharedInformerFactory.WaitForCacheSync(ctx.Done())
 
-			var opts []func(opts *Options)
-			if test.priorityThreshold != nil {
-				opts = append(opts, WithPriorityThreshold(*test.priorityThreshold))
-			}
-			if test.nodeFit {
-				opts = append(opts, WithNodeFit(true))
-			}
-
-			evictorFilter := NewEvictorFilter(
-				nodes,
-				getPodsAssignedToNode,
-				test.evictLocalStoragePods,
-				test.evictSystemCriticalPods,
-				false,
-				test.evictFailedBarePods,
-				opts...,
+			eventRecorder := &events.FakeRecorder{}
+			podEvictor, err := NewPodEvictor(
+				ctx,
+				fakeClient,
+				eventRecorder,
+				sharedInformerFactory.Core().V1().Pods().Informer(),
+				initFeatureGates(),
+				NewOptions(),
 			)
+			if err != nil {
+				t.Fatalf("Unexpected error when creating a pod evictor: %v", err)
+			}
 
-			result := evictorFilter.Filter(test.pods[0])
-			if result != test.result {
-				t.Errorf("IsEvictable should return for pod %s %t, but it returns %t", test.pods[0].Name, test.result, result)
+			_, got := podEvictor.evictPod(ctx, test.evictedPod, EvictOptions{})
+			if got != test.wantErr {
+				t.Errorf("Test error for Desc: %s. Expected %v pod eviction to be %v, got %v", test.description, test.evictedPod.Name, test.wantErr, got)
 			}
 		})
 	}
 }
+
 func TestPodTypes(t *testing.T) {
 	n1 := test.BuildTestNode("node1", 1000, 2000, 9, nil)
 	p1 := test.BuildTestPod("p1", 400, 0, n1.Name, nil)
@@ -675,7 +137,7 @@ func TestPodTypes(t *testing.T) {
 	p1.ObjectMeta.OwnerReferences = test.GetReplicaSetOwnerRefList()
 	// The following 4 pods won't get evicted.
 	// A daemonset.
-	//p2.Annotations = test.GetDaemonSetAnnotation()
+	// p2.Annotations = test.GetDaemonSetAnnotation()
 	p2.ObjectMeta.OwnerReferences = test.GetDaemonSetOwnerRefList()
 	// A pod with local storage.
 	p3.ObjectMeta.OwnerReferences = test.GetNormalPodOwnerRefList()
@@ -685,7 +147,8 @@ func TestPodTypes(t *testing.T) {
 			VolumeSource: v1.VolumeSource{
 				HostPath: &v1.HostPathVolumeSource{Path: "somePath"},
 				EmptyDir: &v1.EmptyDirVolumeSource{
-					SizeLimit: resource.NewQuantity(int64(10), resource.BinarySI)},
+					SizeLimit: resource.NewQuantity(int64(10), resource.BinarySI),
+				},
 			},
 		},
 	}
@@ -705,5 +168,694 @@ func TestPodTypes(t *testing.T) {
 	if utils.IsDaemonsetPod(ownerRefList) || utils.IsPodWithLocalStorage(p1) || utils.IsCriticalPriorityPod(p1) || utils.IsMirrorPod(p1) || utils.IsStaticPod(p1) {
 		t.Errorf("Expected p1 to be a normal pod.")
 	}
+}
 
+func TestNewPodEvictor(t *testing.T) {
+	ctx := context.Background()
+
+	pod1 := test.BuildTestPod("pod", 400, 0, "node", nil)
+	type podEvictorTest struct {
+		description                      string
+		pod                              *v1.Pod
+		dryRun                           bool
+		evictionFailureEventNotification *bool
+		maxPodsToEvictTotal              *uint
+		maxPodsToEvictPerNode            *uint
+		maxPodsToEvictPerNamespace       *uint
+		expectedNodeEvictions            uint
+		expectedTotalEvictions           uint
+		expectedError                    error
+		// expectedEvent is a slice of strings representing expected events.
+		// Each string in the slice should follow the format: "EventType Reason Message".
+		// - "Warning Failed processing failed"
+		events []string
+	}
+	tests := []podEvictorTest{
+		{
+			description:                      "one eviction expected with eviction failure event notification",
+			pod:                              pod1,
+			evictionFailureEventNotification: utilptr.To[bool](true),
+			maxPodsToEvictTotal:              utilptr.To[uint](1),
+			maxPodsToEvictPerNode:            utilptr.To[uint](1),
+			maxPodsToEvictPerNamespace:       utilptr.To[uint](1),
+			expectedNodeEvictions:            1,
+			expectedTotalEvictions:           1,
+			expectedError:                    nil,
+			events:                           []string{"Normal NotSet pod eviction from node node by sigs.k8s.io/descheduler"},
+		},
+		{
+			description:                      "eviction limit exceeded on total with eviction failure event notification",
+			pod:                              pod1,
+			evictionFailureEventNotification: utilptr.To[bool](true),
+			maxPodsToEvictTotal:              utilptr.To[uint](0),
+			maxPodsToEvictPerNode:            utilptr.To[uint](1),
+			maxPodsToEvictPerNamespace:       utilptr.To[uint](1),
+			expectedNodeEvictions:            0,
+			expectedTotalEvictions:           0,
+			expectedError:                    NewEvictionTotalLimitError(),
+			events:                           []string{"Warning EvictionFailed pod eviction from node node by sigs.k8s.io/descheduler failed: total eviction limit exceeded (0)"},
+		},
+		{
+			description:                      "eviction limit exceeded on node with eviction failure event notification",
+			pod:                              pod1,
+			evictionFailureEventNotification: utilptr.To[bool](true),
+			maxPodsToEvictTotal:              utilptr.To[uint](1),
+			maxPodsToEvictPerNode:            utilptr.To[uint](0),
+			maxPodsToEvictPerNamespace:       utilptr.To[uint](1),
+			expectedNodeEvictions:            0,
+			expectedTotalEvictions:           0,
+			expectedError:                    NewEvictionNodeLimitError("node"),
+			events:                           []string{"Warning EvictionFailed pod eviction from node node by sigs.k8s.io/descheduler failed: node eviction limit exceeded (0)"},
+		},
+		{
+			description:                      "eviction limit exceeded on node with eviction failure event notification",
+			pod:                              pod1,
+			evictionFailureEventNotification: utilptr.To[bool](true),
+			maxPodsToEvictTotal:              utilptr.To[uint](1),
+			maxPodsToEvictPerNode:            utilptr.To[uint](1),
+			maxPodsToEvictPerNamespace:       utilptr.To[uint](0),
+			expectedNodeEvictions:            0,
+			expectedTotalEvictions:           0,
+			expectedError:                    NewEvictionNamespaceLimitError("default"),
+			events:                           []string{"Warning EvictionFailed pod eviction from node node by sigs.k8s.io/descheduler failed: namespace eviction limit exceeded (0)"},
+		},
+		{
+			description:                      "eviction error with eviction failure event notification",
+			pod:                              pod1,
+			evictionFailureEventNotification: utilptr.To[bool](true),
+			maxPodsToEvictTotal:              utilptr.To[uint](1),
+			maxPodsToEvictPerNode:            utilptr.To[uint](1),
+			maxPodsToEvictPerNamespace:       utilptr.To[uint](1),
+			expectedNodeEvictions:            0,
+			expectedTotalEvictions:           0,
+			expectedError:                    fmt.Errorf("eviction error"),
+			events:                           []string{"Warning EvictionFailed pod eviction from node node by sigs.k8s.io/descheduler failed: eviction error"},
+		},
+		{
+			description:                      "eviction with dryRun with eviction failure event notification",
+			pod:                              pod1,
+			dryRun:                           true,
+			evictionFailureEventNotification: utilptr.To[bool](true),
+			maxPodsToEvictTotal:              utilptr.To[uint](1),
+			maxPodsToEvictPerNode:            utilptr.To[uint](1),
+			maxPodsToEvictPerNamespace:       utilptr.To[uint](1),
+			expectedNodeEvictions:            1,
+			expectedTotalEvictions:           1,
+			expectedError:                    nil,
+		},
+		{
+			description:                "one eviction expected without eviction failure event notification",
+			pod:                        pod1,
+			maxPodsToEvictTotal:        utilptr.To[uint](1),
+			maxPodsToEvictPerNode:      utilptr.To[uint](1),
+			maxPodsToEvictPerNamespace: utilptr.To[uint](1),
+			expectedNodeEvictions:      1,
+			expectedTotalEvictions:     1,
+			expectedError:              nil,
+			events:                     []string{"Normal NotSet pod eviction from node node by sigs.k8s.io/descheduler"},
+		},
+		{
+			description:                "eviction limit exceeded on total without eviction failure event notification",
+			pod:                        pod1,
+			maxPodsToEvictTotal:        utilptr.To[uint](0),
+			maxPodsToEvictPerNode:      utilptr.To[uint](1),
+			maxPodsToEvictPerNamespace: utilptr.To[uint](1),
+			expectedNodeEvictions:      0,
+			expectedTotalEvictions:     0,
+			expectedError:              NewEvictionTotalLimitError(),
+		},
+		{
+			description:                "eviction limit exceeded on node without eviction failure event notification",
+			pod:                        pod1,
+			maxPodsToEvictTotal:        utilptr.To[uint](1),
+			maxPodsToEvictPerNode:      utilptr.To[uint](0),
+			maxPodsToEvictPerNamespace: utilptr.To[uint](1),
+			expectedNodeEvictions:      0,
+			expectedTotalEvictions:     0,
+			expectedError:              NewEvictionNodeLimitError("node"),
+		},
+		{
+			description:                "eviction limit exceeded on node without eviction failure event notification",
+			pod:                        pod1,
+			maxPodsToEvictTotal:        utilptr.To[uint](1),
+			maxPodsToEvictPerNode:      utilptr.To[uint](1),
+			maxPodsToEvictPerNamespace: utilptr.To[uint](0),
+			expectedNodeEvictions:      0,
+			expectedTotalEvictions:     0,
+			expectedError:              NewEvictionNamespaceLimitError("default"),
+		},
+		{
+			description:                "eviction error without eviction failure event notification",
+			pod:                        pod1,
+			maxPodsToEvictTotal:        utilptr.To[uint](1),
+			maxPodsToEvictPerNode:      utilptr.To[uint](1),
+			maxPodsToEvictPerNamespace: utilptr.To[uint](1),
+			expectedNodeEvictions:      0,
+			expectedTotalEvictions:     0,
+			expectedError:              fmt.Errorf("eviction error"),
+		},
+		{
+			description:                "eviction without dryRun with eviction failure event notification",
+			pod:                        pod1,
+			dryRun:                     true,
+			maxPodsToEvictTotal:        utilptr.To[uint](1),
+			maxPodsToEvictPerNode:      utilptr.To[uint](1),
+			maxPodsToEvictPerNamespace: utilptr.To[uint](1),
+			expectedNodeEvictions:      1,
+			expectedTotalEvictions:     1,
+			expectedError:              nil,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.description, func(t *testing.T) {
+			fakeClient := fakeclientset.NewSimpleClientset(pod1)
+			fakeClient.PrependReactor("create", "pods/eviction", func(action core.Action) (handled bool, ret runtime.Object, err error) {
+				return true, nil, test.expectedError
+			})
+
+			sharedInformerFactory := informers.NewSharedInformerFactory(fakeClient, 0)
+			sharedInformerFactory.Start(ctx.Done())
+			sharedInformerFactory.WaitForCacheSync(ctx.Done())
+
+			eventRecorder := events.NewFakeRecorder(100)
+
+			podEvictor, err := NewPodEvictor(
+				ctx,
+				fakeClient,
+				eventRecorder,
+				sharedInformerFactory.Core().V1().Pods().Informer(),
+				initFeatureGates(),
+				NewOptions().
+					WithDryRun(test.dryRun).
+					WithMaxPodsToEvictTotal(test.maxPodsToEvictTotal).
+					WithMaxPodsToEvictPerNode(test.maxPodsToEvictPerNode).
+					WithEvictionFailureEventNotification(test.evictionFailureEventNotification).
+					WithMaxPodsToEvictPerNamespace(test.maxPodsToEvictPerNamespace),
+			)
+			if err != nil {
+				t.Fatalf("Unexpected error when creating a pod evictor: %v", err)
+			}
+
+			stubNode := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node"}}
+
+			if actualErr := podEvictor.EvictPod(ctx, test.pod, EvictOptions{}); actualErr != nil && actualErr.Error() != test.expectedError.Error() {
+				t.Errorf("Expected error: %v, got: %v", test.expectedError, actualErr)
+			}
+
+			if evictions := podEvictor.NodeEvicted(stubNode); evictions != test.expectedNodeEvictions {
+				t.Errorf("Expected %d node evictions, got %d instead", test.expectedNodeEvictions, evictions)
+			}
+
+			if evictions := podEvictor.TotalEvicted(); evictions != test.expectedTotalEvictions {
+				t.Errorf("Expected %d total evictions, got %d instead", test.expectedTotalEvictions, evictions)
+			}
+
+			// Assert that the events are correct.
+			assertEqualEvents(t, test.events, eventRecorder.Events)
+		})
+	}
+}
+
+func TestEvictionRequestsCacheCleanup(t *testing.T) {
+	ctx := context.Background()
+	node1 := test.BuildTestNode("n1", 2000, 3000, 10, nil)
+
+	ownerRef1 := test.GetReplicaSetOwnerRefList()
+	updatePod := func(pod *v1.Pod) {
+		pod.Namespace = "dev"
+		pod.ObjectMeta.OwnerReferences = ownerRef1
+	}
+	updatePodWithEvictionInBackground := func(pod *v1.Pod) {
+		updatePod(pod)
+		pod.Annotations = map[string]string{
+			EvictionRequestAnnotationKey: "",
+		}
+	}
+
+	p1 := test.BuildTestPod("p1", 100, 0, node1.Name, updatePodWithEvictionInBackground)
+	p2 := test.BuildTestPod("p2", 100, 0, node1.Name, updatePodWithEvictionInBackground)
+	p3 := test.BuildTestPod("p3", 100, 0, node1.Name, updatePod)
+	p4 := test.BuildTestPod("p4", 100, 0, node1.Name, updatePod)
+
+	client := fakeclientset.NewSimpleClientset(node1, p1, p2, p3, p4)
+	sharedInformerFactory := informers.NewSharedInformerFactory(client, 0)
+	_, eventRecorder := utils.GetRecorderAndBroadcaster(ctx, client)
+
+	podEvictor, err := NewPodEvictor(
+		ctx,
+		client,
+		eventRecorder,
+		sharedInformerFactory.Core().V1().Pods().Informer(),
+		initFeatureGates(),
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Unexpected error when creating a pod evictor: %v", err)
+	}
+
+	client.PrependReactor("create", "pods", func(action core.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() == "eviction" {
+			createAct, matched := action.(core.CreateActionImpl)
+			if !matched {
+				return false, nil, fmt.Errorf("unable to convert action to core.CreateActionImpl")
+			}
+			if eviction, matched := createAct.Object.(*policy.Eviction); matched {
+				podName := eviction.GetName()
+				annotations := eviction.GetAnnotations()
+				if (podName == "p1" || podName == "p2") && annotations[requestedByAnnotationKey] == deschedulerGlobalName && strings.HasPrefix(
+					annotations[reasonAnnotationKey],
+					"triggered by",
+				) {
+					return true, nil, &apierrors.StatusError{
+						ErrStatus: metav1.Status{
+							Reason:  metav1.StatusReasonTooManyRequests,
+							Message: "Eviction triggered evacuation",
+						},
+					}
+				}
+				return true, nil, nil
+			}
+		}
+		return false, nil, nil
+	})
+
+	sharedInformerFactory.Start(ctx.Done())
+	sharedInformerFactory.WaitForCacheSync(ctx.Done())
+
+	podEvictor.EvictPod(ctx, p1, EvictOptions{})
+	podEvictor.EvictPod(ctx, p2, EvictOptions{})
+	podEvictor.EvictPod(ctx, p3, EvictOptions{})
+	podEvictor.EvictPod(ctx, p4, EvictOptions{})
+
+	klog.Infof("2 evictions in background expected, 2 normal evictions")
+	if total := podEvictor.TotalEvictionRequests(); total != 2 {
+		t.Fatalf("Expected %v total eviction requests, got %v instead", 2, total)
+	}
+	if total := podEvictor.TotalEvicted(); total != 2 {
+		t.Fatalf("Expected %v total evictions, got %v instead", 2, total)
+	}
+
+	klog.Infof("2 evictions in background assumed. Wait for few seconds and check the assumed requests timed out")
+	time.Sleep(2 * time.Second)
+	klog.Infof("Checking the assumed requests timed out and were deleted")
+	// Set the timeout to 1s so the cleaning can be tested
+	podEvictor.erCache.assumedRequestTimeoutSeconds = 1
+	podEvictor.erCache.cleanCache(ctx)
+	if totalERs := podEvictor.TotalEvictionRequests(); totalERs > 0 {
+		t.Fatalf("Expected 0 eviction requests, got %v instead", totalERs)
+	}
+}
+
+func TestEvictionInBackgroundMetrics(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), wait.ForeverTestTimeout)
+	defer cancel()
+
+	deschedulermetrics.Register()
+	deschedulermetrics.PodsEvicted.Reset()
+	deschedulermetrics.PodsEvictedTotal.Reset()
+
+	node1 := test.BuildTestNode("n1", 2000, 3000, 10, nil)
+
+	ownerRef1 := test.GetReplicaSetOwnerRefList()
+	updatePod := func(pod *v1.Pod) {
+		pod.Namespace = "dev"
+		pod.ObjectMeta.OwnerReferences = ownerRef1
+	}
+	updatePodWithEvictionAnnotation := func(pod *v1.Pod) {
+		updatePod(pod)
+		pod.Annotations = map[string]string{
+			EvictionRequestAnnotationKey: "",
+		}
+	}
+
+	// p1, p2: will be evicted in background
+	// p3, p4: will be evicted normally
+	p1 := test.BuildTestPod("p1", 100, 0, node1.Name, updatePodWithEvictionAnnotation)
+	p2 := test.BuildTestPod("p2", 100, 0, node1.Name, updatePodWithEvictionAnnotation)
+	p3 := test.BuildTestPod("p3", 100, 0, node1.Name, updatePod)
+	p4 := test.BuildTestPod("p4", 100, 0, node1.Name, updatePod)
+
+	client := fakeclientset.NewSimpleClientset(node1, p1, p2, p3, p4)
+	sharedInformerFactory := informers.NewSharedInformerFactory(client, 0)
+	_, eventRecorder := utils.GetRecorderAndBroadcaster(ctx, client)
+
+	podEvictor, err := NewPodEvictor(
+		ctx,
+		client,
+		eventRecorder,
+		sharedInformerFactory.Core().V1().Pods().Informer(),
+		initFeatureGates(),
+		NewOptions().WithMetricsEnabled(true),
+	)
+	if err != nil {
+		t.Fatalf("Unexpected error when creating a pod evictor: %v", err)
+	}
+
+	client.PrependReactor("create", "pods", func(action core.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() == "eviction" {
+			createAct, matched := action.(core.CreateActionImpl)
+			if !matched {
+				return false, nil, fmt.Errorf("unable to convert action to core.CreateActionImpl")
+			}
+			if eviction, matched := createAct.Object.(*policy.Eviction); matched {
+				if eviction.GetName() == "p1" || eviction.GetName() == "p2" {
+					return true, nil, &apierrors.StatusError{
+						ErrStatus: metav1.Status{
+							Reason:  metav1.StatusReasonTooManyRequests,
+							Message: "Eviction triggered evacuation",
+						},
+					}
+				}
+				return true, nil, nil
+			}
+		}
+		return false, nil, nil
+	})
+
+	sharedInformerFactory.Start(ctx.Done())
+	sharedInformerFactory.WaitForCacheSync(ctx.Done())
+
+	evictOpts := EvictOptions{StrategyName: "TestStrategy", ProfileName: "TestProfile"}
+
+	// Cycle 1: p1/p2 go to background, p3/p4 are evicted normally.
+	podEvictor.EvictPod(ctx, p1, evictOpts)
+	podEvictor.EvictPod(ctx, p2, evictOpts)
+	podEvictor.EvictPod(ctx, p3, evictOpts)
+	podEvictor.EvictPod(ctx, p4, evictOpts)
+
+	// After cycle 1: 2 "background" (p1, p2), 2 "success" (p3, p4).
+	metricstest.AssertVectorCount(t, "descheduler_pods_evicted_total", map[string]string{"result": "background"}, 2)
+	metricstest.AssertVectorCount(t, "descheduler_pods_evicted_total", map[string]string{"result": "success"}, 2)
+
+	// Cycle 2: p1/p2 are still running (background eviction in progress).
+	// Re-attempting them must not emit any additional metrics.
+	podEvictor.EvictPod(ctx, p1, evictOpts)
+	podEvictor.EvictPod(ctx, p2, evictOpts)
+
+	// Counts must be unchanged after cycle 2.
+	metricstest.AssertVectorCount(t, "descheduler_pods_evicted_total", map[string]string{"result": "background"}, 2)
+	metricstest.AssertVectorCount(t, "descheduler_pods_evicted_total", map[string]string{"result": "success"}, 2)
+
+	// The background evictions complete: p1 and p2 are deleted.
+	// The informer's DeleteFunc fires and emits a "success" metric for each assumed pod.
+	client.CoreV1().Pods(p1.Namespace).Delete(ctx, p1.Name, metav1.DeleteOptions{})
+	client.CoreV1().Pods(p2.Namespace).Delete(ctx, p2.Name, metav1.DeleteOptions{})
+
+	// Poll until DeleteFunc has fired for both pods (informer is async).
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, wait.ForeverTestTimeout, true, func(ctx context.Context) (bool, error) {
+		return !podEvictor.erCache.hasPod(p1) && !podEvictor.erCache.hasPod(p2), nil
+	}); err != nil {
+		t.Fatalf("Timed out waiting for background evictions to complete: %v", err)
+	}
+
+	// After deletion: "success" grows by 2 (p1, p2 completed), "background" stays at 2.
+	metricstest.AssertVectorCount(t, "descheduler_pods_evicted_total", map[string]string{"result": "success"}, 4)
+	metricstest.AssertVectorCount(t, "descheduler_pods_evicted_total", map[string]string{"result": "background"}, 2)
+}
+
+// TestEvictionInBackgroundMetrics_InformerRace reproduces the race where the
+// informer's UpdateFunc calls addPod (evictionAssumed=false) before evictPod's
+// assumePod call, causing the "success" metric to be silently dropped when the
+// pod is later deleted.
+//
+// The race: evictPod sends the eviction request; the KubeVirt handler sets
+// EvictionInProgressAnnotationKey before returning TooManyRequests, so the
+// informer's UpdateFunc fires and calls addPod (evictionAssumed=false) while
+// evictPod is still waiting for the HTTP response. When the response arrives,
+// assumePod finds the entry already present and returns early, leaving
+// evictionAssumed=false. DeleteFunc then skips the "success" metric.
+func TestEvictionInBackgroundMetrics_InformerRace(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), wait.ForeverTestTimeout)
+	defer cancel()
+
+	deschedulermetrics.Register()
+	deschedulermetrics.PodsEvicted.Reset()
+	deschedulermetrics.PodsEvictedTotal.Reset()
+
+	node1 := test.BuildTestNode("n1", 2000, 3000, 10, nil)
+
+	ownerRef1 := test.GetReplicaSetOwnerRefList()
+	p1 := test.BuildTestPod("p1", 100, 0, node1.Name, func(pod *v1.Pod) {
+		pod.Namespace = "dev"
+		pod.ObjectMeta.OwnerReferences = ownerRef1
+		pod.Annotations = map[string]string{
+			EvictionRequestAnnotationKey: "",
+		}
+	})
+
+	client := fakeclientset.NewSimpleClientset(node1, p1)
+	sharedInformerFactory := informers.NewSharedInformerFactory(client, 0)
+	_, eventRecorder := utils.GetRecorderAndBroadcaster(ctx, client)
+
+	podEvictor, err := NewPodEvictor(
+		ctx,
+		client,
+		eventRecorder,
+		sharedInformerFactory.Core().V1().Pods().Informer(),
+		initFeatureGates(),
+		NewOptions().WithMetricsEnabled(true),
+	)
+	if err != nil {
+		t.Fatalf("Unexpected error when creating a pod evictor: %v", err)
+	}
+
+	// calling erCache.addPod from a goroutine.
+	triggerAddPod := make(chan struct{})
+	addPodDone := make(chan struct{})
+
+	go func() {
+		<-triggerAddPod
+		// Simulate what UpdateFunc does when KubeVirt sets
+		// EvictionInProgressAnnotationKey before the TooManyRequests response
+		// arrives: addPod inserts the entry with evictionAssumed=false.
+		podEvictor.erCache.addPod(p1)
+		close(addPodDone)
+	}()
+
+	client.PrependReactor("create", "pods", func(action core.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() != "eviction" {
+			return false, nil, nil
+		}
+		createAct, ok := action.(core.CreateActionImpl)
+		if !ok {
+			return false, nil, fmt.Errorf("unable to convert action to core.CreateActionImpl")
+		}
+		eviction, ok := createAct.Object.(*policy.Eviction)
+		if !ok || eviction.GetName() != "p1" {
+			return false, nil, nil
+		}
+
+		// Trigger addPod and wait for it to complete before returning
+		// TooManyRequests, ensuring assumePod will find the entry already present.
+		close(triggerAddPod)
+		<-addPodDone
+
+		return true, nil, &apierrors.StatusError{
+			ErrStatus: metav1.Status{
+				Reason:  metav1.StatusReasonTooManyRequests,
+				Message: "Eviction triggered evacuation",
+			},
+		}
+	})
+
+	sharedInformerFactory.Start(ctx.Done())
+	sharedInformerFactory.WaitForCacheSync(ctx.Done())
+
+	evictOpts := EvictOptions{StrategyName: "TestStrategy", ProfileName: "TestProfile"}
+	podEvictor.EvictPod(ctx, p1, evictOpts)
+
+	// The "background" metric must have been emitted.
+	metricstest.AssertVectorCount(t, "descheduler_pods_evicted_total", map[string]string{"result": "background"}, 1)
+
+	// Simulate the background eviction completing: the pod is deleted.
+	client.CoreV1().Pods(p1.Namespace).Delete(ctx, p1.Name, metav1.DeleteOptions{})
+
+	// Wait until DeleteFunc has fired and removed the pod from the cache.
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, wait.ForeverTestTimeout, true, func(ctx context.Context) (bool, error) {
+		return !podEvictor.erCache.hasPod(p1), nil
+	}); err != nil {
+		t.Fatalf("Timed out waiting for background eviction to complete: %v", err)
+	}
+
+	// "success" must also be 1: the background eviction completed.
+	// Without the fix this will be 0 because assumePod returned early (entry
+	// already present from addPod) leaving evictionAssumed=false.
+	metricstest.AssertVectorCount(t, "descheduler_pods_evicted_total", map[string]string{"result": "success"}, 1)
+}
+
+// TestEvictionInBackgroundMetrics_PodCompleted verifies that when a pod
+// transitions to a terminal phase via UpdateFunc (without ever being deleted),
+// the correct metric is emitted: "success" for PodSucceeded, "error" for PodFailed.
+func TestEvictionInBackgroundMetrics_PodCompleted(t *testing.T) {
+	testCases := []struct {
+		name           string
+		phase          v1.PodPhase
+		expectedResult string
+	}{
+		{name: "PodSucceeded emits success", phase: v1.PodSucceeded, expectedResult: "success"},
+		{name: "PodFailed emits error", phase: v1.PodFailed, expectedResult: "error"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), wait.ForeverTestTimeout)
+			defer cancel()
+
+			deschedulermetrics.Register()
+			deschedulermetrics.PodsEvicted.Reset()
+			deschedulermetrics.PodsEvictedTotal.Reset()
+
+			node1 := test.BuildTestNode("n1", 2000, 3000, 10, nil)
+			ownerRef1 := test.GetReplicaSetOwnerRefList()
+			p1 := test.BuildTestPod("p1", 100, 0, node1.Name, func(pod *v1.Pod) {
+				pod.Namespace = "dev"
+				pod.ObjectMeta.OwnerReferences = ownerRef1
+				pod.Annotations = map[string]string{
+					EvictionRequestAnnotationKey: "",
+				}
+			})
+
+			client := fakeclientset.NewSimpleClientset(node1, p1)
+			sharedInformerFactory := informers.NewSharedInformerFactory(client, 0)
+			_, eventRecorder := utils.GetRecorderAndBroadcaster(ctx, client)
+
+			podEvictor, err := NewPodEvictor(
+				ctx,
+				client,
+				eventRecorder,
+				sharedInformerFactory.Core().V1().Pods().Informer(),
+				initFeatureGates(),
+				NewOptions().WithMetricsEnabled(true),
+			)
+			if err != nil {
+				t.Fatalf("Unexpected error when creating a pod evictor: %v", err)
+			}
+
+			client.PrependReactor("create", "pods", func(action core.Action) (bool, runtime.Object, error) {
+				if action.GetSubresource() != "eviction" {
+					return false, nil, nil
+				}
+				return true, nil, &apierrors.StatusError{
+					ErrStatus: metav1.Status{
+						Reason:  metav1.StatusReasonTooManyRequests,
+						Message: "Eviction triggered evacuation",
+					},
+				}
+			})
+
+			sharedInformerFactory.Start(ctx.Done())
+			sharedInformerFactory.WaitForCacheSync(ctx.Done())
+
+			evictOpts := EvictOptions{StrategyName: "TestStrategy", ProfileName: "TestProfile"}
+			podEvictor.EvictPod(ctx, p1, evictOpts)
+
+			metricstest.AssertVectorCount(t, "descheduler_pods_evicted_total", map[string]string{"result": "background"}, 1)
+
+			// Transition the pod to a terminal phase without deleting it.
+			p1Updated := p1.DeepCopy()
+			p1Updated.Status.Phase = tc.phase
+			client.CoreV1().Pods(p1.Namespace).UpdateStatus(ctx, p1Updated, metav1.UpdateOptions{})
+
+			// Wait for UpdateFunc to fire and remove the pod from the cache.
+			if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, wait.ForeverTestTimeout, true, func(ctx context.Context) (bool, error) {
+				return !podEvictor.erCache.hasPod(p1), nil
+			}); err != nil {
+				t.Fatalf("Timed out waiting for background eviction to complete: %v", err)
+			}
+
+			metricstest.AssertVectorCount(t, "descheduler_pods_evicted_total", map[string]string{"result": tc.expectedResult}, 1)
+		})
+	}
+}
+
+// TestEvictionInBackgroundMetrics_AssumedTimeout verifies that when an assumed
+// eviction entry expires in cleanCache, the "error" metric is emitted.
+func TestEvictionInBackgroundMetrics_AssumedTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), wait.ForeverTestTimeout)
+	defer cancel()
+
+	deschedulermetrics.Register()
+	deschedulermetrics.PodsEvicted.Reset()
+	deschedulermetrics.PodsEvictedTotal.Reset()
+
+	node1 := test.BuildTestNode("n1", 2000, 3000, 10, nil)
+	ownerRef1 := test.GetReplicaSetOwnerRefList()
+	p1 := test.BuildTestPod("p1", 100, 0, node1.Name, func(pod *v1.Pod) {
+		pod.Namespace = "dev"
+		pod.ObjectMeta.OwnerReferences = ownerRef1
+		pod.Annotations = map[string]string{
+			EvictionRequestAnnotationKey: "",
+		}
+	})
+
+	client := fakeclientset.NewSimpleClientset(node1, p1)
+	sharedInformerFactory := informers.NewSharedInformerFactory(client, 0)
+	_, eventRecorder := utils.GetRecorderAndBroadcaster(ctx, client)
+
+	podEvictor, err := NewPodEvictor(
+		ctx,
+		client,
+		eventRecorder,
+		sharedInformerFactory.Core().V1().Pods().Informer(),
+		initFeatureGates(),
+		NewOptions().WithMetricsEnabled(true),
+	)
+	if err != nil {
+		t.Fatalf("Unexpected error when creating a pod evictor: %v", err)
+	}
+
+	client.PrependReactor("create", "pods", func(action core.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() != "eviction" {
+			return false, nil, nil
+		}
+		return true, nil, &apierrors.StatusError{
+			ErrStatus: metav1.Status{
+				Reason:  metav1.StatusReasonTooManyRequests,
+				Message: "Eviction triggered evacuation",
+			},
+		}
+	})
+
+	sharedInformerFactory.Start(ctx.Done())
+	sharedInformerFactory.WaitForCacheSync(ctx.Done())
+
+	evictOpts := EvictOptions{StrategyName: "TestStrategy", ProfileName: "TestProfile"}
+	podEvictor.EvictPod(ctx, p1, evictOpts)
+
+	metricstest.AssertVectorCount(t, "descheduler_pods_evicted_total", map[string]string{"result": "background"}, 1)
+
+	// Back-date all assumed entries so they appear expired, then run cleanCache.
+	podEvictor.erCache.mu.Lock()
+	for uid, item := range podEvictor.erCache.requests {
+		item.assumedTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
+		podEvictor.erCache.requests[uid] = item
+	}
+	podEvictor.erCache.mu.Unlock()
+	podEvictor.erCache.cleanCache(ctx)
+
+	metricstest.AssertVectorCount(t, "descheduler_pods_evicted_total", map[string]string{"result": "error"}, 1)
+}
+
+func assertEqualEvents(t *testing.T, expected []string, actual <-chan string) {
+	t.Logf("Assert for events: %v", expected)
+	c := time.After(wait.ForeverTestTimeout)
+	for _, e := range expected {
+		select {
+		case a := <-actual:
+			if !reflect.DeepEqual(a, e) {
+				t.Errorf("Expected event %q, got %q instead", e, a)
+			}
+		case <-c:
+			t.Errorf("Expected event %q, got nothing", e)
+			// continue iterating to print all expected events
+		}
+	}
+	for {
+		select {
+		case a := <-actual:
+			t.Errorf("Unexpected event: %q", a)
+		default:
+			return // No more events, as expected.
+		}
+	}
 }

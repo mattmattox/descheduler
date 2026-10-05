@@ -18,7 +18,9 @@ package api
 
 import (
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -26,99 +28,135 @@ import (
 type DeschedulerPolicy struct {
 	metav1.TypeMeta
 
-	// Strategies
-	Strategies StrategyList
+	// Profiles
+	Profiles []DeschedulerProfile
 
 	// NodeSelector for a set of nodes to operate over
 	NodeSelector *string
-
-	// EvictFailedBarePods allows pods without ownerReferences and in failed phase to be evicted.
-	EvictFailedBarePods *bool
-
-	// EvictLocalStoragePods allows pods using local storage to be evicted.
-	EvictLocalStoragePods *bool
-
-	// EvictSystemCriticalPods allows eviction of pods of any priority (including Kubernetes system pods)
-	EvictSystemCriticalPods *bool
-
-	// IgnorePVCPods prevents pods with PVCs from being evicted.
-	IgnorePVCPods *bool
 
 	// MaxNoOfPodsToEvictPerNode restricts maximum of pods to be evicted per node.
 	MaxNoOfPodsToEvictPerNode *uint
 
 	// MaxNoOfPodsToEvictPerNamespace restricts maximum of pods to be evicted per namespace.
 	MaxNoOfPodsToEvictPerNamespace *uint
-}
 
-type StrategyName string
-type StrategyList map[StrategyName]DeschedulerStrategy
+	// MaxNoOfPodsToTotal restricts maximum of pods to be evicted total.
+	MaxNoOfPodsToEvictTotal *uint
 
-type DeschedulerStrategy struct {
-	// Enabled or disabled
-	Enabled bool
+	// EvictionFailureEventNotification should be set to true to enable eviction failure event notification.
+	// Default is false.
+	EvictionFailureEventNotification *bool
 
-	// Weight
-	Weight int
+	// MetricsCollector configures collection of metrics about actual resource utilization
+	// Deprecated. Use MetricsProviders field instead.
+	MetricsCollector *MetricsCollector
 
-	// Strategy parameters
-	Params *StrategyParameters
+	// MetricsProviders configure collection of metrics about actual resource utilization from various sources
+	MetricsProviders []MetricsProvider
+
+	// GracePeriodSeconds The duration in seconds before the object should be deleted. Value must be non-negative integer.
+	// The value zero indicates delete immediately. If this value is nil, the default grace period for the
+	// specified type will be used.
+	// Defaults to a per object value if not specified. zero means delete immediately.
+	GracePeriodSeconds *int64
 }
 
 // Namespaces carries a list of included/excluded namespaces
 // for which a given strategy is applicable
 type Namespaces struct {
-	Include []string
-	Exclude []string
+	Include []string `json:"include,omitempty"`
+	Exclude []string `json:"exclude,omitempty"`
 }
 
-// Besides Namespaces only one of its members may be specified
-// TODO(jchaloup): move Namespaces ThresholdPriority and ThresholdPriorityClassName to individual strategies
-//  once the policy version is bumped to v1alpha2
-type StrategyParameters struct {
-	NodeResourceUtilizationThresholds *NodeResourceUtilizationThresholds
-	NodeAffinityType                  []string
-	PodsHavingTooManyRestarts         *PodsHavingTooManyRestarts
-	PodLifeTime                       *PodLifeTime
-	RemoveDuplicates                  *RemoveDuplicates
-	FailedPods                        *FailedPods
-	IncludeSoftConstraints            bool
-	Namespaces                        *Namespaces
-	ThresholdPriority                 *int32
-	ThresholdPriorityClassName        string
-	LabelSelector                     *metav1.LabelSelector
-	NodeFit                           bool
-	IncludePreferNoSchedule           bool
-	ExcludedTaints                    []string
+// EvictionLimits limits the number of evictions per domain. E.g. node, namespace, total.
+type EvictionLimits struct {
+	// node restricts the maximum number of evictions per node
+	Node *uint `json:"node,omitempty"`
 }
 
-type Percentage float64
-type ResourceThresholds map[v1.ResourceName]Percentage
+type (
+	Percentage         float64
+	ResourceThresholds map[v1.ResourceName]Percentage
+)
 
-type NodeResourceUtilizationThresholds struct {
-	UseDeviationThresholds bool
-	Thresholds             ResourceThresholds
-	TargetThresholds       ResourceThresholds
-	NumberOfNodes          int
+type PriorityThreshold struct {
+	Value *int32 `json:"value"`
+	Name  string `json:"name"`
 }
 
-type PodsHavingTooManyRestarts struct {
-	PodRestartThreshold     int32
-	IncludingInitContainers bool
+type DeschedulerProfile struct {
+	Name          string
+	PluginConfigs []PluginConfig
+	Plugins       Plugins
 }
 
-type RemoveDuplicates struct {
-	ExcludeOwnerKinds []string
+type PluginConfig struct {
+	Name string
+	Args runtime.Object
 }
 
-type PodLifeTime struct {
-	MaxPodLifeTimeSeconds *uint
-	PodStatusPhases       []string
+type Plugins struct {
+	PreSort           PluginSet
+	Sort              PluginSet
+	Deschedule        PluginSet
+	Balance           PluginSet
+	Filter            PluginSet
+	PreEvictionFilter PluginSet
 }
 
-type FailedPods struct {
-	ExcludeOwnerKinds       []string
-	MinPodLifetimeSeconds   *uint
-	Reasons                 []string
-	IncludingInitContainers bool
+type PluginSet struct {
+	Enabled  []string
+	Disabled []string
+}
+
+type MetricsSource string
+
+const (
+	// KubernetesMetrics enables metrics from a Kubernetes metrics server.
+	// Please see https://kubernetes-sigs.github.io/metrics-server/ for more.
+	KubernetesMetrics MetricsSource = "KubernetesMetrics"
+
+	// KubernetesMetrics enables metrics from a Prometheus metrics server.
+	PrometheusMetrics MetricsSource = "Prometheus"
+)
+
+// MetricsCollector configures collection of metrics about actual resource utilization
+type MetricsCollector struct {
+	// Enabled metrics collection from Kubernetes metrics.
+	// Deprecated. Use MetricsProvider.Source field instead.
+	Enabled bool
+}
+
+// MetricsProvider configures collection of metrics about actual resource utilization from a given source
+type MetricsProvider struct {
+	// Source enables metrics from Kubernetes metrics server.
+	Source MetricsSource
+
+	// Prometheus enables metrics collection through Prometheus
+	Prometheus *Prometheus
+}
+
+// ReferencedResourceList is an adaption of v1.ResourceList with resources as references
+type ReferencedResourceList = map[v1.ResourceName]*resource.Quantity
+
+type Prometheus struct {
+	URL string
+	// authToken used for authentication with the prometheus server.
+	// If not set the in cluster authentication token for the descheduler service
+	// account is read from the container's file system.
+	AuthToken *AuthToken
+}
+
+type AuthToken struct {
+	// secretReference references an authentication token.
+	// secrets are expected to be created under the descheduler's namespace.
+	SecretReference *SecretReference
+}
+
+// SecretReference holds a reference to a Secret
+type SecretReference struct {
+	// namespace is the namespace of the secret.
+	Namespace string
+	// name is the name of the secret.
+	Name string
 }

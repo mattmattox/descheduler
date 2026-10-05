@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -10,116 +11,174 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/utils/pointer"
+	componentbaseconfig "k8s.io/component-base/config"
+	utilptr "k8s.io/utils/ptr"
 
-	deschedulerapi "sigs.k8s.io/descheduler/pkg/api"
-	"sigs.k8s.io/descheduler/pkg/descheduler/evictions"
-	"sigs.k8s.io/descheduler/pkg/descheduler/strategies"
+	"sigs.k8s.io/descheduler/pkg/api"
+	apiv1alpha2 "sigs.k8s.io/descheduler/pkg/api/v1alpha2"
+	"sigs.k8s.io/descheduler/pkg/descheduler/client"
+	"sigs.k8s.io/descheduler/pkg/framework/plugins/defaultevictor"
+	"sigs.k8s.io/descheduler/pkg/framework/plugins/removefailedpods"
 )
 
-var oneHourPodLifetimeSeconds uint = 3600
+var (
+	oneHourPodLifetimeSeconds   uint = 3600
+	oneSecondPodLifetimeSeconds uint = 1
+)
+
+func removeFailedPodsPolicy(removeFailedPodsArgs *removefailedpods.RemoveFailedPodsArgs, evictorArgs *defaultevictor.DefaultEvictorArgs) *apiv1alpha2.DeschedulerPolicy {
+	return &apiv1alpha2.DeschedulerPolicy{
+		Profiles: []apiv1alpha2.DeschedulerProfile{
+			{
+				Name: removefailedpods.PluginName + "Profile",
+				PluginConfigs: []apiv1alpha2.PluginConfig{
+					{
+						Name: removefailedpods.PluginName,
+						Args: runtime.RawExtension{
+							Object: removeFailedPodsArgs,
+						},
+					},
+					{
+						Name: defaultevictor.PluginName,
+						Args: runtime.RawExtension{
+							Object: evictorArgs,
+						},
+					},
+				},
+				Plugins: apiv1alpha2.Plugins{
+					Filter: apiv1alpha2.PluginSet{
+						Enabled: []string{
+							defaultevictor.PluginName,
+						},
+					},
+					Deschedule: apiv1alpha2.PluginSet{
+						Enabled: []string{
+							removefailedpods.PluginName,
+						},
+					},
+				},
+			},
+		},
+	}
+}
 
 func TestFailedPods(t *testing.T) {
 	ctx := context.Background()
-	clientSet, _, getPodsAssignedToNode, stopCh := initializeClient(t)
-	defer close(stopCh)
-	nodeList, err := clientSet.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+
+	clientSet, err := client.CreateClient(componentbaseconfig.ClientConnectionConfiguration{Kubeconfig: os.Getenv("KUBECONFIG")}, "")
 	if err != nil {
-		t.Errorf("Error listing node with %v", err)
+		t.Errorf("Error during kubernetes client creation with %v", err)
 	}
-	nodes, _ := splitNodesAndWorkerNodes(nodeList.Items)
+
 	t.Log("Creating testing namespace")
 	testNamespace := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "e2e-" + strings.ToLower(t.Name())}}
 	if _, err := clientSet.CoreV1().Namespaces().Create(ctx, testNamespace, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("Unable to create ns %v", testNamespace.Name)
 	}
 	defer clientSet.CoreV1().Namespaces().Delete(ctx, testNamespace.Name, metav1.DeleteOptions{})
-	testCases := map[string]struct {
-		expectedEvictedCount uint
-		strategyParams       *deschedulerapi.StrategyParameters
+
+	tests := []struct {
+		name                    string
+		expectedEvictedPodCount int
+		removeFailedPodsArgs    *removefailedpods.RemoveFailedPodsArgs
 	}{
-		"test-failed-pods-nil-strategy": {
-			expectedEvictedCount: 1,
-			strategyParams:       nil,
-		},
-		"test-failed-pods-default-strategy": {
-			expectedEvictedCount: 1,
-			strategyParams:       &deschedulerapi.StrategyParameters{},
-		},
-		"test-failed-pods-default-failed-pods": {
-			expectedEvictedCount: 1,
-			strategyParams: &deschedulerapi.StrategyParameters{
-				FailedPods: &deschedulerapi.FailedPods{},
+		{
+			name:                    "test-failed-pods-default-args",
+			expectedEvictedPodCount: 1,
+			removeFailedPodsArgs: &removefailedpods.RemoveFailedPodsArgs{
+				MinPodLifetimeSeconds: &oneSecondPodLifetimeSeconds,
 			},
 		},
-		"test-failed-pods-reason-unmatched": {
-			expectedEvictedCount: 0,
-			strategyParams: &deschedulerapi.StrategyParameters{
-				FailedPods: &deschedulerapi.FailedPods{Reasons: []string{"ReasonDoesNotMatch"}},
+		{
+			name:                    "test-failed-pods-reason-unmatched",
+			expectedEvictedPodCount: 0,
+			removeFailedPodsArgs: &removefailedpods.RemoveFailedPodsArgs{
+				Reasons:               []string{"ReasonDoesNotMatch"},
+				MinPodLifetimeSeconds: &oneSecondPodLifetimeSeconds,
 			},
 		},
-		"test-failed-pods-min-age-unmet": {
-			expectedEvictedCount: 0,
-			strategyParams: &deschedulerapi.StrategyParameters{
-				FailedPods: &deschedulerapi.FailedPods{MinPodLifetimeSeconds: &oneHourPodLifetimeSeconds},
+		{
+			name:                    "test-failed-pods-min-age-unmet",
+			expectedEvictedPodCount: 0,
+			removeFailedPodsArgs: &removefailedpods.RemoveFailedPodsArgs{
+				MinPodLifetimeSeconds: &oneHourPodLifetimeSeconds,
 			},
 		},
-		"test-failed-pods-exclude-job-kind": {
-			expectedEvictedCount: 0,
-			strategyParams: &deschedulerapi.StrategyParameters{
-				FailedPods: &deschedulerapi.FailedPods{ExcludeOwnerKinds: []string{"Job"}},
+		{
+			name:                    "test-failed-pods-exclude-job-kind",
+			expectedEvictedPodCount: 0,
+			removeFailedPodsArgs: &removefailedpods.RemoveFailedPodsArgs{
+				ExcludeOwnerKinds:     []string{"Job"},
+				MinPodLifetimeSeconds: &oneSecondPodLifetimeSeconds,
 			},
 		},
 	}
-	for name, tc := range testCases {
-		t.Run(name, func(t *testing.T) {
-			job := initFailedJob(name, testNamespace.Namespace)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			job := initFailedJob(tc.name, testNamespace.Namespace)
 			t.Logf("Creating job %s in %s namespace", job.Name, job.Namespace)
 			jobClient := clientSet.BatchV1().Jobs(testNamespace.Name)
 			if _, err := jobClient.Create(ctx, job, metav1.CreateOptions{}); err != nil {
-				t.Fatalf("Error creating Job %s: %v", name, err)
+				t.Fatalf("Error creating Job %s: %v", tc.name, err)
 			}
 			deletePropagationPolicy := metav1.DeletePropagationForeground
-			defer jobClient.Delete(ctx, job.Name, metav1.DeleteOptions{PropagationPolicy: &deletePropagationPolicy})
+			defer func() {
+				jobClient.Delete(ctx, job.Name, metav1.DeleteOptions{PropagationPolicy: &deletePropagationPolicy})
+				waitForPodsToDisappear(ctx, t, clientSet, job.Labels, job.Namespace)
+			}()
 			waitForJobPodPhase(ctx, t, clientSet, job, v1.PodFailed)
 
-			podEvictor := initPodEvictorOrFail(t, clientSet, getPodsAssignedToNode, nodes)
+			preRunNames := sets.NewString(getCurrentPodNames(ctx, clientSet, testNamespace.Name, t)...)
 
-			t.Logf("Running RemoveFailedPods strategy for %s", name)
-			strategies.RemoveFailedPods(
-				ctx,
-				clientSet,
-				deschedulerapi.DeschedulerStrategy{
-					Enabled: true,
-					Params:  tc.strategyParams,
-				},
-				nodes,
-				podEvictor,
-				evictions.NewEvictorFilter(
-					nodes,
-					getPodsAssignedToNode,
-					true,
-					false,
-					false,
-					false,
-				),
-				getPodsAssignedToNode,
-			)
-			t.Logf("Finished RemoveFailedPods strategy for %s", name)
+			// Deploy the descheduler with the configured policy
+			evictorArgs := &defaultevictor.DefaultEvictorArgs{
+				EvictLocalStoragePods:   true,
+				EvictSystemCriticalPods: false,
+				IgnorePvcPods:           false,
+				EvictFailedBarePods:     false,
+			}
+			tc.removeFailedPodsArgs.Namespaces = &api.Namespaces{
+				Include: []string{testNamespace.Name},
+			}
 
-			if actualEvictedCount := podEvictor.TotalEvicted(); actualEvictedCount == tc.expectedEvictedCount {
-				t.Logf("Total of %d Pods were evicted for %s", actualEvictedCount, name)
+			createPolicyConfigMap(t, ctx, clientSet, removeFailedPodsPolicy(tc.removeFailedPodsArgs, evictorArgs))
+
+			deschedulerDeploymentObj := deschedulerDeployment(testNamespace.Name)
+			createDeschedulerDeploymentWithCleanup(t, ctx, clientSet, deschedulerDeploymentObj)
+
+			// Run RemoveDuplicates strategy
+			var meetsExpectations bool
+			var actualEvictedPodCount int
+			if err := wait.PollUntilContextTimeout(ctx, 5*time.Second, 60*time.Second, true, func(ctx context.Context) (bool, error) {
+				currentRunNames := sets.NewString(getCurrentPodNames(ctx, clientSet, testNamespace.Name, t)...)
+				actualEvictedPod := preRunNames.Difference(currentRunNames)
+				actualEvictedPodCount = actualEvictedPod.Len()
+				t.Logf("preRunNames: %v, currentRunNames: %v, actualEvictedPodCount: %v\n", preRunNames.List(), currentRunNames.List(), actualEvictedPodCount)
+				if actualEvictedPodCount != tc.expectedEvictedPodCount {
+					t.Logf("Expecting %v number of pods evicted, got %v instead", tc.expectedEvictedPodCount, actualEvictedPodCount)
+					return false, nil
+				}
+				meetsExpectations = true
+				return true, nil
+			}); err != nil {
+				t.Errorf("Error waiting for descheduler running: %v", err)
+			}
+
+			if !meetsExpectations {
+				t.Errorf("Unexpected number of pods have been evicted, got %v, expected %v", actualEvictedPodCount, tc.expectedEvictedPodCount)
 			} else {
-				t.Errorf("Unexpected number of pods have been evicted, got %v, expected %v", actualEvictedCount, tc.expectedEvictedCount)
+				t.Logf("Total of %d Pods were evicted for %s", actualEvictedPodCount, tc.name)
 			}
 		})
 	}
 }
 
 func initFailedJob(name, namespace string) *batchv1.Job {
-	podSpec := MakePodSpec("", nil)
+	podSpec := makePodSpec("", nil)
 	podSpec.Containers[0].Command = []string{"/bin/false"}
 	podSpec.RestartPolicy = v1.RestartPolicyNever
 	labelsSet := labels.Set{"test": name, "name": name}
@@ -134,14 +193,14 @@ func initFailedJob(name, namespace string) *batchv1.Job {
 				Spec:       podSpec,
 				ObjectMeta: metav1.ObjectMeta{Labels: labelsSet},
 			},
-			BackoffLimit: pointer.Int32(0),
+			BackoffLimit: utilptr.To[int32](0),
 		},
 	}
 }
 
 func waitForJobPodPhase(ctx context.Context, t *testing.T, clientSet clientset.Interface, job *batchv1.Job, phase v1.PodPhase) {
 	podClient := clientSet.CoreV1().Pods(job.Namespace)
-	if err := wait.PollImmediate(5*time.Second, 30*time.Second, func() (bool, error) {
+	if err := wait.PollUntilContextTimeout(ctx, 5*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
 		t.Log(labels.FormatLabels(job.Labels))
 		if podList, err := podClient.List(ctx, metav1.ListOptions{LabelSelector: labels.FormatLabels(job.Labels)}); err != nil {
 			return false, err

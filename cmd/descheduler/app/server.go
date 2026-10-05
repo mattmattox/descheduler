@@ -22,20 +22,22 @@ import (
 	"io"
 	"os/signal"
 	"syscall"
-
-	"k8s.io/apiserver/pkg/server/healthz"
-
-	"sigs.k8s.io/descheduler/cmd/descheduler/app/options"
-	"sigs.k8s.io/descheduler/pkg/descheduler"
+	"time"
 
 	"github.com/spf13/cobra"
 
-	apiserver "k8s.io/apiserver/pkg/server"
+	"sigs.k8s.io/descheduler/cmd/descheduler/app/options"
+	"sigs.k8s.io/descheduler/pkg/descheduler"
+	"sigs.k8s.io/descheduler/pkg/features"
+	"sigs.k8s.io/descheduler/pkg/tracing"
+
+	"k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/apiserver/pkg/server/healthz"
 	"k8s.io/apiserver/pkg/server/mux"
-	restclient "k8s.io/client-go/rest"
-	"k8s.io/component-base/config"
+	"k8s.io/component-base/logs"
+	logsapi "k8s.io/component-base/logs/api/v1"
 	_ "k8s.io/component-base/logs/json/register"
-	"k8s.io/component-base/logs/registry"
 	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/klog/v2"
 )
@@ -43,66 +45,97 @@ import (
 // NewDeschedulerCommand creates a *cobra.Command object with default parameters
 func NewDeschedulerCommand(out io.Writer) *cobra.Command {
 	s, err := options.NewDeschedulerServer()
-
 	if err != nil {
 		klog.ErrorS(err, "unable to initialize server")
 	}
 
+	logConfig := logsapi.NewLoggingConfiguration()
+
 	cmd := &cobra.Command{
 		Use:   "descheduler",
 		Short: "descheduler",
-		Long:  `The descheduler evicts pods which may be bound to less desired nodes`,
-		Run: func(cmd *cobra.Command, args []string) {
-			// s.Logs.Config.Format = s.Logging.Format
-
-			// LoopbackClientConfig is a config for a privileged loopback connection
-			var LoopbackClientConfig *restclient.Config
-			var SecureServing *apiserver.SecureServingInfo
-			if err := s.SecureServing.ApplyTo(&SecureServing, &LoopbackClientConfig); err != nil {
-				klog.ErrorS(err, "failed to apply secure server configuration")
-				return
+		Long:  "The descheduler evicts pods which may be bound to less desired nodes",
+		PreRunE: func(cmd *cobra.Command, args []string) error {
+			logs.InitLogs()
+			if err := features.DefaultMutableFeatureGate.SetFromMap(s.FeatureGates); err != nil {
+				return err
+			}
+			if err := logsapi.ValidateAndApply(logConfig, features.DefaultMutableFeatureGate); err != nil {
+				return err
+			}
+			descheduler.SetupPlugins()
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err = s.Apply(); err != nil {
+				klog.ErrorS(err, "failed to apply")
+				return err
 			}
 
-			factory, _ := registry.LogRegistry.Get(s.Logging.Format)
-			if factory == nil {
-				klog.ClearLogger()
-			} else {
-				log, logrFlush := factory.Create(config.LoggingConfiguration{})
-				defer logrFlush()
-				klog.SetLogger(log)
+			if err = Run(cmd.Context(), s); err != nil {
+				klog.ErrorS(err, "failed to run descheduler server")
+				return err
 			}
 
-			ctx, done := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-
-			pathRecorderMux := mux.NewPathRecorderMux("descheduler")
-			if !s.DisableMetrics {
-				pathRecorderMux.Handle("/metrics", legacyregistry.HandlerWithReset())
-			}
-
-			healthz.InstallHandler(pathRecorderMux, healthz.NamedCheck("Descheduler", healthz.PingHealthz.Check))
-
-			stoppedCh, _, err := SecureServing.Serve(pathRecorderMux, 0, ctx.Done())
-			if err != nil {
-				klog.Fatalf("failed to start secure server: %v", err)
-				return
-			}
-
-			err = Run(ctx, s)
-			if err != nil {
-				klog.ErrorS(err, "descheduler server")
-			}
-
-			done()
-			// wait for metrics server to close
-			<-stoppedCh
+			return nil
 		},
 	}
 	cmd.SetOut(out)
 	flags := cmd.Flags()
+	runtime.Must(logsapi.AddFeatureGates(features.DefaultMutableFeatureGate))
 	s.AddFlags(flags)
+
+	logsapi.AddFlags(logConfig, flags)
+
 	return cmd
 }
 
-func Run(ctx context.Context, rs *options.DeschedulerServer) error {
-	return descheduler.Run(ctx, rs)
+func Run(rootCtx context.Context, rs *options.DeschedulerServer) error {
+	ctx, done := signal.NotifyContext(rootCtx, syscall.SIGINT, syscall.SIGTERM)
+
+	pathRecorderMux := mux.NewPathRecorderMux("descheduler")
+	if !rs.DisableMetrics {
+		pathRecorderMux.Handle("/metrics", legacyregistry.HandlerWithReset())
+	}
+
+	healthz.InstallHandler(pathRecorderMux, healthz.NamedCheck("Descheduler", healthz.PingHealthz.Check))
+
+	var stoppedCh <-chan struct{}
+	var err error
+	if rs.SecureServingInfo != nil {
+		stoppedCh, _, err = rs.SecureServingInfo.Serve(pathRecorderMux, 0, ctx.Done())
+		if err != nil {
+			klog.Fatalf("failed to start secure server: %v", err)
+			return err
+		}
+	}
+
+	err = tracing.NewTracerProvider(ctx, rs.Tracing.CollectorEndpoint, rs.Tracing.TransportCert, rs.Tracing.ServiceName, rs.Tracing.ServiceNamespace, rs.Tracing.SampleRate, rs.Tracing.FallbackToNoOpProviderOnError)
+	if err != nil {
+		klog.ErrorS(err, "failed to create tracer provider")
+	}
+	defer func() {
+		// we give the tracing.Shutdown() its own context as the
+		// original context may have been cancelled already. we
+		// have arbitrarily chosen the timeout duration.
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		tracing.Shutdown(ctx)
+	}()
+
+	// increase the fake watch channel so the dry-run mode can be run
+	// over a cluster with thousands of pods
+	watch.DefaultChanSize = 100000
+	err = descheduler.Run(ctx, rs)
+	if err != nil {
+		return err
+	}
+
+	done()
+	if stoppedCh != nil {
+		// wait for metrics server to close
+		<-stoppedCh
+	}
+
+	return nil
 }

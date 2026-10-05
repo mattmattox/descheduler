@@ -17,37 +17,78 @@ limitations under the License.
 package client
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"time"
 
-	clientset "k8s.io/client-go/kubernetes"
+	promapi "github.com/prometheus/client_golang/api"
+	"github.com/prometheus/common/config"
+
 	// Ensure to load all auth plugins.
+	clientset "k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/transport"
+	componentbaseconfig "k8s.io/component-base/config"
+	metricsclient "k8s.io/metrics/pkg/client/clientset/versioned"
 )
 
-func CreateClient(kubeconfig string) (clientset.Interface, error) {
+var K8sPodCAFilePath = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+func createConfig(clientConnection componentbaseconfig.ClientConnectionConfiguration, userAgt string) (*rest.Config, error) {
 	var cfg *rest.Config
-	if len(kubeconfig) != 0 {
-		master, err := GetMasterFromKubeconfig(kubeconfig)
+	if len(clientConnection.Kubeconfig) != 0 {
+		master, err := GetMasterFromKubeconfig(clientConnection.Kubeconfig)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to parse kubeconfig file: %v ", err)
+			return nil, fmt.Errorf("failed to parse kubeconfig file: %v ", err)
 		}
 
-		cfg, err = clientcmd.BuildConfigFromFlags(master, kubeconfig)
+		cfg, err = clientcmd.BuildConfigFromFlags(master, clientConnection.Kubeconfig)
 		if err != nil {
-			return nil, fmt.Errorf("Unable to build config: %v", err)
+			return nil, fmt.Errorf("unable to build config: %v", err)
 		}
 
 	} else {
 		var err error
 		cfg, err = rest.InClusterConfig()
 		if err != nil {
-			return nil, fmt.Errorf("Unable to build in cluster config: %v", err)
+			return nil, fmt.Errorf("unable to build in cluster config: %v", err)
 		}
 	}
 
+	cfg.Burst = int(clientConnection.Burst)
+	cfg.QPS = clientConnection.QPS
+
+	if len(userAgt) != 0 {
+		cfg = rest.AddUserAgent(cfg, userAgt)
+	}
+
+	return cfg, nil
+}
+
+func CreateClient(clientConnection componentbaseconfig.ClientConnectionConfiguration, userAgt string) (clientset.Interface, error) {
+	cfg, err := createConfig(clientConnection, userAgt)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create config: %v", err)
+	}
+
 	return clientset.NewForConfig(cfg)
+}
+
+func CreateMetricsClient(clientConnection componentbaseconfig.ClientConnectionConfiguration, userAgt string) (metricsclient.Interface, error) {
+	cfg, err := createConfig(clientConnection, userAgt)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create config: %v", err)
+	}
+
+	// Create the metrics clientset to access the metrics.k8s.io API
+	return metricsclient.NewForConfig(cfg)
 }
 
 func GetMasterFromKubeconfig(filename string) (string, error) {
@@ -58,11 +99,69 @@ func GetMasterFromKubeconfig(filename string) (string, error) {
 
 	context, ok := config.Contexts[config.CurrentContext]
 	if !ok {
-		return "", fmt.Errorf("Failed to get master address from kubeconfig")
+		return "", fmt.Errorf("failed to get master address from kubeconfig: current context not found")
 	}
 
 	if val, ok := config.Clusters[context.Cluster]; ok {
 		return val.Server, nil
 	}
-	return "", fmt.Errorf("Failed to get master address from kubeconfig")
+	return "", fmt.Errorf("failed to get master address from kubeconfig: cluster information not found")
+}
+
+func loadCAFile(filepath string) (*x509.CertPool, error) {
+	caCert, err := os.ReadFile(filepath)
+	if err != nil {
+		return nil, err
+	}
+
+	caCertPool := x509.NewCertPool()
+	if ok := caCertPool.AppendCertsFromPEM(caCert); !ok {
+		return nil, fmt.Errorf("failed to append CA certificate to the pool")
+	}
+
+	return caCertPool, nil
+}
+
+func CreatePrometheusClient(prometheusURL, authToken string) (promapi.Client, *http.Transport, error) {
+	// Retrieve Pod CA cert
+	caCertPool, err := loadCAFile(K8sPodCAFilePath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("error loading CA file: %v", err)
+	}
+
+	// Get Prometheus Host
+	u, err := url.Parse(prometheusURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("error parsing prometheus URL: %v", err)
+	}
+	t := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:        100,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		TLSClientConfig: &tls.Config{
+			RootCAs:    caCertPool,
+			ServerName: u.Host,
+		},
+	}
+	roundTripper := transport.NewBearerAuthRoundTripper(
+		authToken,
+		t,
+	)
+
+	if authToken != "" {
+		client, err := promapi.NewClient(promapi.Config{
+			Address:      prometheusURL,
+			RoundTripper: config.NewAuthorizationCredentialsRoundTripper("Bearer", config.NewInlineSecret(authToken), roundTripper),
+		})
+		return client, t, err
+	}
+	client, err := promapi.NewClient(promapi.Config{
+		Address: prometheusURL,
+	})
+	return client, t, err
 }

@@ -14,6 +14,8 @@
 
 .PHONY: test
 
+export CONTAINER_ENGINE ?= docker
+
 # VERSION is based on a date stamp plus the last commit
 VERSION?=v$(shell date +%Y%m%d)-$(shell git describe --tags)
 BRANCH?=$(shell git branch --show-current)
@@ -24,8 +26,13 @@ ARCHS = amd64 arm arm64
 
 LDFLAGS=-ldflags "-X ${LDFLAG_LOCATION}.version=${VERSION} -X ${LDFLAG_LOCATION}.buildDate=${BUILD} -X ${LDFLAG_LOCATION}.gitbranch=${BRANCH} -X ${LDFLAG_LOCATION}.gitsha1=${SHA1}"
 
-GOLANGCI_VERSION := v1.46.1
+GOLANGCI_VERSION := v2.8.0
 HAS_GOLANGCI := $(shell ls _output/bin/golangci-lint 2> /dev/null)
+
+GOFUMPT_VERSION := v0.10.0
+HAS_GOFUMPT := $(shell command -v gofumpt 2> /dev/null)
+
+GO_VERSION := $(shell (command -v jq > /dev/null && (go mod edit -json | jq -r .Go)) || (sed -En 's/^go (.*)$$/\1/p' go.mod))
 
 # REGISTRY is the container registry to push
 # into. The default is to push to the staging
@@ -37,6 +44,10 @@ IMAGE:=descheduler:$(VERSION)
 
 # IMAGE_GCLOUD is the image name of descheduler in the remote registry
 IMAGE_GCLOUD:=$(REGISTRY)/descheduler:$(VERSION)
+
+# CURRENT_DIR is the current dir where the Makefile exists
+CURRENT_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+
 
 # TODO: upload binaries to GCS bucket
 #
@@ -60,42 +71,42 @@ build.arm64:
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build ${LDFLAGS} -o _output/bin/descheduler sigs.k8s.io/descheduler/cmd/descheduler
 
 dev-image: build
-	docker build -f Dockerfile.dev -t $(IMAGE) .
+	$(CONTAINER_ENGINE) build -f Dockerfile.dev -t $(IMAGE) .
 
 image:
-	docker build --build-arg VERSION="$(VERSION)" --build-arg ARCH="amd64" -t $(IMAGE) .
+	$(CONTAINER_ENGINE) build --build-arg VERSION="$(VERSION)" --build-arg ARCH="amd64" -t $(IMAGE) .
 
 image.amd64:
-	docker build --build-arg VERSION="$(VERSION)" --build-arg ARCH="amd64" -t $(IMAGE)-amd64 .
+	$(CONTAINER_ENGINE) build --build-arg VERSION="$(VERSION)" --build-arg ARCH="amd64" -t $(IMAGE)-amd64 .
 
 image.arm:
-	docker build --build-arg VERSION="$(VERSION)" --build-arg ARCH="arm" -t $(IMAGE)-arm .
+	$(CONTAINER_ENGINE) build --build-arg VERSION="$(VERSION)" --build-arg ARCH="arm" -t $(IMAGE)-arm .
 
 image.arm64:
-	docker build --build-arg VERSION="$(VERSION)" --build-arg ARCH="arm64" -t $(IMAGE)-arm64 .
+	$(CONTAINER_ENGINE) build --build-arg VERSION="$(VERSION)" --build-arg ARCH="arm64" -t $(IMAGE)-arm64 .
 
 push: image
 	gcloud auth configure-docker
-	docker tag $(IMAGE) $(IMAGE_GCLOUD)
-	docker push $(IMAGE_GCLOUD)
+	$(CONTAINER_ENGINE) tag $(IMAGE) $(IMAGE_GCLOUD)
+	$(CONTAINER_ENGINE) push $(IMAGE_GCLOUD)
 
 push-all: image.amd64 image.arm image.arm64
 	gcloud auth configure-docker
 	for arch in $(ARCHS); do \
-		docker tag $(IMAGE)-$${arch} $(IMAGE_GCLOUD)-$${arch} ;\
-		docker push $(IMAGE_GCLOUD)-$${arch} ;\
+		$(CONTAINER_ENGINE) tag $(IMAGE)-$${arch} $(IMAGE_GCLOUD)-$${arch} ;\
+		$(CONTAINER_ENGINE) push $(IMAGE_GCLOUD)-$${arch} ;\
 	done
-	DOCKER_CLI_EXPERIMENTAL=enabled docker manifest create $(IMAGE_GCLOUD) $(addprefix --amend $(IMAGE_GCLOUD)-, $(ARCHS))
+	DOCKER_CLI_EXPERIMENTAL=enabled $(CONTAINER_ENGINE) manifest create $(IMAGE_GCLOUD) $(addprefix --amend $(IMAGE_GCLOUD)-, $(ARCHS))
 	for arch in $(ARCHS); do \
-		DOCKER_CLI_EXPERIMENTAL=enabled docker manifest annotate --arch $${arch} $(IMAGE_GCLOUD) $(IMAGE_GCLOUD)-$${arch} ;\
+		DOCKER_CLI_EXPERIMENTAL=enabled $(CONTAINER_ENGINE) manifest annotate --arch $${arch} $(IMAGE_GCLOUD) $(IMAGE_GCLOUD)-$${arch} ;\
 	done
-	DOCKER_CLI_EXPERIMENTAL=enabled docker manifest push $(IMAGE_GCLOUD) ;\
+	DOCKER_CLI_EXPERIMENTAL=enabled $(CONTAINER_ENGINE) manifest push $(IMAGE_GCLOUD) ;\
 
 clean:
 	rm -rf _output
 	rm -rf _tmp
 
-verify: verify-govet verify-spelling verify-gofmt verify-vendor lint lint-chart verify-toc verify-gen
+verify: verify-govet verify-spelling verify-gofmt verify-vendor lint lint-chart verify-gen
 
 verify-govet:
 	./hack/verify-govet.sh
@@ -109,8 +120,8 @@ verify-gofmt:
 verify-vendor:
 	./hack/verify-vendor.sh
 
-verify-toc:
-	./hack/verify-toc.sh
+verify-docs:
+	./hack/verify-docs.sh
 
 test-unit:
 	./test/run-unit-tests.sh
@@ -122,26 +133,49 @@ gen:
 	./hack/update-generated-conversions.sh
 	./hack/update-generated-deep-copies.sh
 	./hack/update-generated-defaulters.sh
-	./hack/update-toc.sh
+	./hack/update-docs.sh
+
+gen-docker:
+	$(CONTAINER_ENGINE) run --entrypoint make -it -v $(CURRENT_DIR):/go/src/sigs.k8s.io/descheduler -w /go/src/sigs.k8s.io/descheduler golang:$(GO_VERSION) gen
 
 verify-gen:
 	./hack/verify-conversions.sh
 	./hack/verify-deep-copies.sh
 	./hack/verify-defaulters.sh
+	./hack/verify-docs.sh
 
 lint:
 ifndef HAS_GOLANGCI
-	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b ./_output/bin ${GOLANGCI_VERSION}
+	GOBIN=$(CURRENT_DIR)/_output/bin go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_VERSION}
 endif
-	./_output/bin/golangci-lint run
+	./_output/bin/golangci-lint run -v
+	./_output/bin/golangci-lint fmt -v
 
-lint-chart: ensure-helm-install
-	helm lint ./charts/descheduler
+fmt:
+ifndef HAS_GOFUMPT
+	go install mvdan.cc/gofumpt@${GOFUMPT_VERSION}
+endif
+	gofumpt -w -extra .
+	goimports -w pkg metrics test
 
-test-helm: ensure-helm-install
-	./test/run-helm-tests.sh
+# helm
 
 ensure-helm-install:
 ifndef HAS_HELM
 	curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 && chmod 700 ./get_helm.sh && ./get_helm.sh
 endif
+
+lint-chart: ensure-helm-install
+	helm lint ./charts/descheduler
+
+build-helm:
+	helm package ./charts/descheduler --dependency-update --destination ./bin/chart
+
+test-helm: ensure-helm-install
+	./test/run-helm-tests.sh
+
+kind-multi-node:
+	kind create cluster --name kind --config ./hack/kind_config.yaml --wait 2m
+
+ct-helm:
+	./hack/verify-chart.sh

@@ -6,7 +6,7 @@ metadata:
   labels:
     {{- include "descheduler.labels" . | nindent 4 }}
 rules:
-- apiGroups: [""]
+- apiGroups: ["events.k8s.io"]
   resources: ["events"]
   verbs: ["create", "update"]
 - apiGroups: [""]
@@ -17,12 +17,15 @@ rules:
   verbs: ["get", "watch", "list"]
 - apiGroups: [""]
   resources: ["pods"]
-  verbs: ["get", "watch", "list", "delete"]
+  verbs: ["get", "watch", "list"]
 - apiGroups: [""]
   resources: ["pods/eviction"]
   verbs: ["create"]
 - apiGroups: ["scheduling.k8s.io"]
   resources: ["priorityclasses"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["policy"]
+  resources: ["poddisruptionbudgets"]
   verbs: ["get", "watch", "list"]
 {{- if .Values.leaderElection.enabled }}
 - apiGroups: ["coordination.k8s.io"]
@@ -30,14 +33,19 @@ rules:
   verbs: ["create", "update"]
 - apiGroups: ["coordination.k8s.io"]
   resources: ["leases"]
-  resourceNames: ["descheduler"]
+  resourceNames: ["{{ .Values.leaderElection.resourceName | default "descheduler" }}"]
   verbs: ["get", "patch", "delete"]
 {{- end }}
-{{- if .Values.podSecurityPolicy.create }}
-- apiGroups: ['policy']
-  resources: ['podsecuritypolicies']
-  verbs:     ['use']
-  resourceNames:
-  - {{ template "descheduler.fullname" . }}
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "watch", "list"]
+{{- if and .Values.deschedulerPolicy }}
+{{- range .Values.deschedulerPolicy.metricsProviders }}
+{{- if and (hasKey . "source") (eq .source "KubernetesMetrics") }}
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["pods", "nodes"]
+  verbs: ["get", "list"]
+{{- end }}
+{{- end }}
 {{- end }}
 {{- end -}}

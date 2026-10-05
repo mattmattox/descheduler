@@ -6,7 +6,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
-var supportedQoSComputeResources = sets.NewString(string(v1.ResourceCPU), string(v1.ResourceMemory))
+var supportedQoSComputeResources = sets.New(string(v1.ResourceCPU), string(v1.ResourceMemory))
 
 // QOSList is a set of (resource name, QoS class) pairs.
 type QOSList map[v1.ResourceName]v1.PodQOSClass
@@ -20,6 +20,10 @@ func isSupportedQoSComputeResource(name v1.ResourceName) bool {
 // A pod is guaranteed only when requests and limits are specified for all the containers and they are equal.
 // A pod is burstable if limits and requests do not match across all containers.
 func GetPodQOS(pod *v1.Pod) v1.PodQOSClass {
+	if len(pod.Status.QOSClass) != 0 {
+		return pod.Status.QOSClass
+	}
+
 	requests := v1.ResourceList{}
 	limits := v1.ResourceList{}
 	zeroQuantity := resource.MustParse("0")
@@ -44,7 +48,7 @@ func GetPodQOS(pod *v1.Pod) v1.PodQOSClass {
 			}
 		}
 		// process limits
-		qosLimitsFound := sets.NewString()
+		qosLimitsFound := sets.New[string]()
 		for name, quantity := range container.Resources.Limits {
 			if !isSupportedQoSComputeResource(name) {
 				continue

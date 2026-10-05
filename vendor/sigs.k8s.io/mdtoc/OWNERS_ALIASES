@@ -7,7 +7,9 @@ aliases:
     - johnbelamaric
     - jeremyrickard
   sig-release-leads:
-    - alejandrox1
-    - justaugustus
-    - saschagrunert
-    - tpepper
+    - cpanato # SIG Technical Lead
+    - jeremyrickard # SIG Chair
+    - justaugustus # SIG Chair
+    - puerco # SIG Technical Lead
+    - saschagrunert # SIG Chair
+    - Verolop # SIG Technical Lead

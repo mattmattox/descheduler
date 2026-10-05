@@ -3,7 +3,7 @@
 ## Required Tools
 
 - [Git](https://git-scm.com/downloads)
-- [Go 1.16+](https://golang.org/dl/)
+- [Go 1.23+](https://golang.org/dl/)
 - [Docker](https://docs.docker.com/install/)
 - [kubectl](https://kubernetes.io/docs/tasks/tools/install-kubectl)
 - [kind v0.10.0+](https://kind.sigs.k8s.io/)
@@ -20,7 +20,7 @@ make
 
 Run descheduler.
 ```sh
-./_output/bin/descheduler --kubeconfig <path to kubeconfig> --policy-config-file <path-to-policy-file> --v 1
+./_output/bin/descheduler --client-connection-kubeconfig <path to kubeconfig> --policy-config-file <path-to-policy-file> --v 1
 ```
 
 View all CLI options.
@@ -29,9 +29,28 @@ View all CLI options.
 ```
 
 ## Run Tests
+
+### All-in-one e2e (kind cluster created by the test script)
+
+```
+KIND_E2E=1 make test-e2e
+```
+
+Optional skip flags (set to any non-empty value to skip that step):
+
+| Variable | Skips |
+|----------|-------|
+| `SKIP_INSTALL` | kind node-image build and cluster create |
+| `SKIP_KUBECTL_INSTALL` | kubectl download |
+| `SKIP_KIND_INSTALL` | kind binary download |
+| `SKIP_KUBEVIRT_INSTALL` | KubeVirt operator install |
+| `SKIP_METRICS_SERVER_INSTALL` | metrics-server install |
+
+### Manual kind cluster (iterative development)
+
 ```
 GOOS=linux make dev-image
-kind create cluster --config hack/kind_config.yaml
+make kind-multi-node
 kind load docker-image <image name>
 kind get kubeconfig > /tmp/admin.conf
 export KUBECONFIG=/tmp/admin.conf
@@ -39,17 +58,38 @@ make test-unit
 make test-e2e
 ```
 
-## Run Helm Tests
-Run the helm test for a particular descheduler release by setting below variables,
-```
-HELM_IMAGE_REPO="descheduler"
-HELM_IMAGE_TAG="helm-test"
-HELM_CHART_LOCATION="./charts/descheduler"
-```
-The helm tests runs as part of descheduler CI. But, to run it manually from the descheduler root,
+## Format Code
+
+After making changes in the code base, ensure that the code is formatted correctly:
 
 ```
-make test-helm
+make fmt
+```
+
+## Build Helm Package locally
+
+If you made some changes in the chart, and just want to check if templating is ok, or if the chart is buildable, you can run this command to have a package built from the `./charts` directory.
+
+```
+make build-helm
+```
+
+## Lint Helm Chart locally
+
+To check linting of your changes in the helm chart locally you can run:
+
+```
+make lint-chart
+```
+
+## Test helm changes locally with kind and ct
+
+You will need kind and docker (or equivalent) installed. We can use ct public image to avoid installing ct and all its dependencies.
+
+
+```
+make kind-multi-node
+make ct-helm
 ```
 
 ### Miscellaneous

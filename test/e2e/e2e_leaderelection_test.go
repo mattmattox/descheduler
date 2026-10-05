@@ -27,20 +27,63 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/utils/pointer"
+	componentbaseconfig "k8s.io/component-base/config"
 
-	"sigs.k8s.io/descheduler/cmd/descheduler/app/options"
-	"sigs.k8s.io/descheduler/pkg/descheduler"
+	"sigs.k8s.io/descheduler/pkg/api"
+	apiv1alpha2 "sigs.k8s.io/descheduler/pkg/api/v1alpha2"
+	"sigs.k8s.io/descheduler/pkg/descheduler/client"
+	"sigs.k8s.io/descheduler/pkg/framework/plugins/defaultevictor"
+	"sigs.k8s.io/descheduler/pkg/framework/plugins/podlifetime"
 )
+
+func podlifetimePolicy(podLifeTimeArgs *podlifetime.PodLifeTimeArgs, evictorArgs *defaultevictor.DefaultEvictorArgs) *apiv1alpha2.DeschedulerPolicy {
+	return &apiv1alpha2.DeschedulerPolicy{
+		Profiles: []apiv1alpha2.DeschedulerProfile{
+			{
+				Name: podlifetime.PluginName + "Profile",
+				PluginConfigs: []apiv1alpha2.PluginConfig{
+					{
+						Name: podlifetime.PluginName,
+						Args: runtime.RawExtension{
+							Object: podLifeTimeArgs,
+						},
+					},
+					{
+						Name: defaultevictor.PluginName,
+						Args: runtime.RawExtension{
+							Object: evictorArgs,
+						},
+					},
+				},
+				Plugins: apiv1alpha2.Plugins{
+					Filter: apiv1alpha2.PluginSet{
+						Enabled: []string{
+							defaultevictor.PluginName,
+						},
+					},
+					Deschedule: apiv1alpha2.PluginSet{
+						Enabled: []string{
+							podlifetime.PluginName,
+						},
+					},
+				},
+			},
+		},
+	}
+}
 
 func TestLeaderElection(t *testing.T) {
 	ctx := context.Background()
 
-	clientSet, _, _, stopCh := initializeClient(t)
-	defer close(stopCh)
+	clientSet, err := client.CreateClient(componentbaseconfig.ClientConnectionConfiguration{Kubeconfig: os.Getenv("KUBECONFIG")}, "")
+	if err != nil {
+		t.Errorf("Error during kubernetes client creation with %v", err)
+	}
 
 	ns1 := "e2e-" + strings.ToLower(t.Name()+"-a")
 	ns2 := "e2e-" + strings.ToLower(t.Name()+"-b")
@@ -59,76 +102,66 @@ func TestLeaderElection(t *testing.T) {
 	}
 	defer clientSet.CoreV1().Namespaces().Delete(ctx, testNamespace2.Name, metav1.DeleteOptions{})
 
-	deployment1, err := createDeployment(ctx, clientSet, ns1, 5, t)
+	testLabel := map[string]string{"test": "leaderelection", "name": "test-leaderelection"}
+	deployment1 := buildTestDeployment("leaderelection", ns1, 5, testLabel, nil)
+	err = createDeployment(t, ctx, clientSet, deployment1)
 	if err != nil {
 		t.Fatalf("create deployment 1: %v", err)
 	}
-	defer clientSet.AppsV1().Deployments(deployment1.Namespace).Delete(ctx, deployment1.Name, metav1.DeleteOptions{})
 
-	deployment2, err := createDeployment(ctx, clientSet, ns2, 5, t)
+	deployment2 := buildTestDeployment("leaderelection", ns2, 5, testLabel, nil)
+	err = createDeployment(t, ctx, clientSet, deployment2)
 	if err != nil {
 		t.Fatalf("create deployment 2: %v", err)
 	}
-	defer clientSet.AppsV1().Deployments(deployment2.Namespace).Delete(ctx, deployment2.Name, metav1.DeleteOptions{})
-
-	waitForPodsRunning(ctx, t, clientSet, map[string]string{"test": "leaderelection", "name": "test-leaderelection"}, 5, ns1)
-
-	podListAOrg := getPodNameList(ctx, clientSet, ns1, t)
-
-	waitForPodsRunning(ctx, t, clientSet, map[string]string{"test": "leaderelection", "name": "test-leaderelection"}, 5, ns2)
-
-	podListBOrg := getPodNameList(ctx, clientSet, ns2, t)
-
-	s1, err := options.NewDeschedulerServer()
-	if err != nil {
-		t.Fatalf("unable to initialize server: %v", err)
-	}
-	s1.Client = clientSet
-	s1.DeschedulingInterval = 5 * time.Second
-	s1.LeaderElection.LeaderElect = true
-	s1.KubeconfigFile = os.Getenv("KUBECONFIG")
-	s1.PolicyConfigFile = "./policy_leaderelection_a.yaml"
-
-	s2, err := options.NewDeschedulerServer()
-	if err != nil {
-		t.Fatalf("unable to initialize server: %v", err)
-	}
-	s2.Client = clientSet
-	s2.DeschedulingInterval = 5 * time.Second
-	s2.LeaderElection.LeaderElect = true
-	s2.KubeconfigFile = os.Getenv("KUBECONFIG")
-	s2.PolicyConfigFile = "./policy_leaderelection_b.yaml"
-
-	t.Log("starting deschedulers")
-
-	go func() {
-		err := descheduler.Run(ctx, s1)
-		if err != nil {
-			t.Errorf("unable to start descheduler: %v", err)
-			return
-		}
+	defer func() {
+		clientSet.AppsV1().Deployments(deployment1.Namespace).Delete(ctx, deployment1.Name, metav1.DeleteOptions{})
+		clientSet.AppsV1().Deployments(deployment2.Namespace).Delete(ctx, deployment2.Name, metav1.DeleteOptions{})
 	}()
 
+	waitForPodsRunning(ctx, t, clientSet, deployment1.Labels, 5, deployment1.Namespace)
+	podListAOrg := getCurrentPodNames(ctx, clientSet, ns1, t)
+
+	waitForPodsRunning(ctx, t, clientSet, deployment2.Labels, 5, deployment2.Namespace)
+	podListBOrg := getCurrentPodNames(ctx, clientSet, ns2, t)
+
+	// Delete the descheduler lease
+	err = clientSet.CoordinationV1().Leases("kube-system").Delete(ctx, "descheduler", metav1.DeleteOptions{})
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			t.Fatalf("Unable to remove kube-system/descheduler lease: %v", err)
+		}
+	}
+	t.Logf("Removed kube-system/descheduler lease")
+
+	t.Log("Starting deschedulers")
+	pod1Name, deploy1, _ := startDeschedulerServer(t, ctx, clientSet, ns1)
 	time.Sleep(1 * time.Second)
-
-	go func() {
-		err := descheduler.Run(ctx, s2)
-		if err != nil {
-			t.Errorf("unable to start descheduler: %v", err)
-			return
+	pod2Name, deploy2, _ := startDeschedulerServer(t, ctx, clientSet, ns2)
+	defer func() {
+		for _, podName := range []string{pod1Name, pod2Name} {
+			printPodLogs(ctx, t, clientSet, podName)
 		}
-	}()
 
-	defer clientSet.CoordinationV1().Leases(s1.LeaderElection.ResourceNamespace).Delete(ctx, s1.LeaderElection.ResourceName, metav1.DeleteOptions{})
-	defer clientSet.CoordinationV1().Leases(s2.LeaderElection.ResourceNamespace).Delete(ctx, s2.LeaderElection.ResourceName, metav1.DeleteOptions{})
+		for _, deploy := range []*appsv1.Deployment{deploy1, deploy2} {
+			t.Logf("Deleting %q deployment...", deploy.Name)
+			err = clientSet.AppsV1().Deployments(deploy.Namespace).Delete(ctx, deploy.Name, metav1.DeleteOptions{})
+			if err != nil {
+				t.Fatalf("Unable to delete %q deployment: %v", deploy.Name, err)
+			}
+
+			waitForPodsToDisappear(ctx, t, clientSet, deploy.Labels, deploy.Namespace)
+		}
+
+		clientSet.CoordinationV1().Leases("kube-system").Delete(ctx, "descheduler", metav1.DeleteOptions{})
+	}()
 
 	// wait for a while so all the pods are 5 seconds older
 	time.Sleep(7 * time.Second)
 
 	// validate only pods from e2e-testleaderelection-a namespace are evicted.
-	podListA := getPodNameList(ctx, clientSet, ns1, t)
-
-	podListB := getPodNameList(ctx, clientSet, ns2, t)
+	podListA := getCurrentPodNames(ctx, clientSet, ns1, t)
+	podListB := getCurrentPodNames(ctx, clientSet, ns2, t)
 
 	left := reflect.DeepEqual(podListAOrg, podListA)
 	right := reflect.DeepEqual(podListBOrg, podListB)
@@ -142,61 +175,86 @@ func TestLeaderElection(t *testing.T) {
 			t.Logf("Only the pods in %s namespace are evicted. Pods before: %s, Pods after %s", ns2, podListBOrg, podListB)
 		}
 	} else {
-		t.Fatalf("Pods are evicted in both namespaces. For %s namespace Pods before: %s, Pods after %s. And, for %s namespace Pods before: %s, Pods after: %s", ns1, podListAOrg, podListA, ns2, podListBOrg, podListB)
+		if left && right {
+			t.Fatalf("No pods evicted. Probably none of the deschedulers were running.")
+		} else {
+			t.Fatalf("Pods are evicted in both namespaces.\n\tFor %s namespace\n\tPods before: %s,\n\tPods after %s.\n\tAnd, for %s namespace\n\tPods before: %s,\n\tPods after: %s", ns1, podListAOrg, podListA, ns2, podListBOrg, podListB)
+		}
 	}
 }
 
-func createDeployment(ctx context.Context, clientSet clientset.Interface, namespace string, replicas int32, t *testing.T) (*appsv1.Deployment, error) {
-	deployment := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "leaderelection",
-			Namespace: namespace,
-			Labels:    map[string]string{"test": "leaderelection", "name": "test-leaderelection"},
-		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: pointer.Int32(replicas),
-			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{"test": "leaderelection", "name": "test-leaderelection"},
-			},
-			Template: v1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{"test": "leaderelection", "name": "test-leaderelection"},
-				},
-				Spec: v1.PodSpec{
-					Containers: []v1.Container{{
-						Name:            "pause",
-						ImagePullPolicy: "Always",
-						Image:           "kubernetes/pause",
-						Ports:           []v1.ContainerPort{{ContainerPort: 80}},
-					}},
-				},
-			},
-		},
-	}
-
+func createDeployment(t *testing.T, ctx context.Context, clientSet clientset.Interface, deployment *appsv1.Deployment) error {
 	t.Logf("Creating deployment %v for namespace %s", deployment.Name, deployment.Namespace)
-	deployment, err := clientSet.AppsV1().Deployments(deployment.Namespace).Create(ctx, deployment, metav1.CreateOptions{})
+	_, err := clientSet.AppsV1().Deployments(deployment.Namespace).Create(ctx, deployment, metav1.CreateOptions{})
 	if err != nil {
 		t.Logf("Error creating deployment: %v", err)
 		if err = clientSet.AppsV1().Deployments(deployment.Namespace).DeleteCollection(ctx, metav1.DeleteOptions{}, metav1.ListOptions{
-			LabelSelector: labels.SelectorFromSet(labels.Set(map[string]string{"test": "leaderelection", "name": "test-leaderelection"})).String(),
+			LabelSelector: labels.SelectorFromSet(deployment.Labels).String(),
 		}); err != nil {
 			t.Fatalf("Unable to delete deployment: %v", err)
 		}
-		return nil, fmt.Errorf("create deployment %v", err)
+		return fmt.Errorf("create deployment %v", err)
 	}
-	return deployment, nil
+	return nil
 }
 
-func getPodNameList(ctx context.Context, clientSet clientset.Interface, namespace string, t *testing.T) []string {
-	podList, err := clientSet.CoreV1().Pods(namespace).List(
-		ctx, metav1.ListOptions{LabelSelector: labels.SelectorFromSet(labels.Set(map[string]string{"test": "leaderelection", "name": "test-leaderelection"})).String()})
+func startDeschedulerServer(t *testing.T, ctx context.Context, clientSet clientset.Interface, testName string) (string, *appsv1.Deployment, *v1.ConfigMap) {
+	var maxLifeTime uint = 5
+	podLifeTimeArgs := &podlifetime.PodLifeTimeArgs{
+		MaxPodLifeTimeSeconds: &maxLifeTime,
+		Namespaces: &api.Namespaces{
+			Include: []string{testName},
+		},
+	}
+
+	// Deploy the descheduler with the configured policy
+	evictorArgs := &defaultevictor.DefaultEvictorArgs{
+		EvictLocalStoragePods:   true,
+		EvictSystemCriticalPods: false,
+		IgnorePvcPods:           false,
+		EvictFailedBarePods:     false,
+	}
+	deschedulerPolicyConfigMapObj, err := deschedulerPolicyConfigMap(podlifetimePolicy(podLifeTimeArgs, evictorArgs))
 	if err != nil {
-		t.Fatalf("Unable to list pods from ns: %s: %v", namespace, err)
+		t.Fatalf("Error creating %q CM: %v", deschedulerPolicyConfigMapObj.Name, err)
 	}
-	podNames := make([]string, len(podList.Items))
-	for i, pod := range podList.Items {
-		podNames[i] = pod.Name
+	deschedulerPolicyConfigMapObj.Name = fmt.Sprintf("%s-%s", deschedulerPolicyConfigMapObj.Name, testName)
+	createConfigMapWithCleanup(t, ctx, clientSet, deschedulerPolicyConfigMapObj)
+
+	deschedulerDeploymentObj := deschedulerDeployment(testName)
+	deschedulerDeploymentObj.Name = fmt.Sprintf("%s-%s", deschedulerDeploymentObj.Name, testName)
+	deschedulerDeploymentObj.Spec.Template.Spec.Containers[0].Args = []string{
+		"--policy-config-file", "/policy-dir/policy.yaml",
+		"--descheduling-interval", "3s",
+		"--v", "4",
+		"--leader-elect",
+		"--leader-elect-retry-period", "1s",
 	}
-	return podNames
+	deschedulerDeploymentObj.Spec.Template.Spec.Volumes = []v1.Volume{
+		{
+			Name: "policy-volume",
+			VolumeSource: v1.VolumeSource{
+				ConfigMap: &v1.ConfigMapVolumeSource{
+					LocalObjectReference: v1.LocalObjectReference{
+						Name: deschedulerPolicyConfigMapObj.Name,
+					},
+				},
+			},
+		},
+	}
+
+	t.Logf("Creating descheduler deployment %v", deschedulerDeploymentObj.Name)
+	_, err = clientSet.AppsV1().Deployments(deschedulerDeploymentObj.Namespace).Create(ctx, deschedulerDeploymentObj, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating %q deployment: %v", deschedulerDeploymentObj.Name, err)
+	}
+
+	t.Logf("Waiting for the descheduler pod running")
+	var podName string
+	pods := waitForPodsRunning(ctx, t, clientSet, deschedulerDeploymentObj.Labels, 1, deschedulerDeploymentObj.Namespace)
+	if len(pods) != 0 {
+		podName = pods[0].Name
+	}
+
+	return podName, deschedulerDeploymentObj, deschedulerPolicyConfigMapObj
 }

@@ -1,17 +1,20 @@
 {{- if eq .Values.kind "Deployment" }}
 {{- if eq .Values.serviceMonitor.enabled true }}
-apiVersion: monitoring.coreos.com/v1
+apiVersion: {{ .Values.serviceMonitor.apiVersion | default "monitoring.coreos.com/v1" }}
 kind: ServiceMonitor
 metadata:
   name: {{ template "descheduler.fullname" . }}-servicemonitor
   namespace: {{ .Values.serviceMonitor.namespace | default .Release.Namespace }}
   labels:
     {{- include "descheduler.labels" . | nindent 4 }}
+    {{- if .Values.serviceMonitor.additionalLabels }}
+    {{- toYaml .Values.serviceMonitor.additionalLabels | nindent 4 }}
+    {{- end }}
 spec:
   jobLabel: jobLabel
   namespaceSelector:
     matchNames:
-    - {{ .Release.Namespace }}
+    - {{ include "descheduler.namespace" . }}
   selector:
     matchLabels:
       {{- include "descheduler.selectorLabels" . | nindent 6 }}
